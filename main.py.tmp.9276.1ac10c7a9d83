@@ -1,0 +1,1211 @@
+import copy
+import json
+import random
+
+from nicegui import ui
+from faker_fields import generate_documents, FAKER_TYPES
+from db_store import insert_documents
+from schema_store import load_schemas, save_schema, delete_schema
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+_id_ctr = 100
+
+def _new_id() -> int:
+    global _id_ctr
+    _id_ctr += 1
+    return _id_ctr
+
+
+TYPE_OPTIONS = [
+    "String", "Int32", "Int64", "Double", "Decimal128",
+    "Boolean", "Date", "ObjectId", "UUID", "Binary",
+    "Array", "Object", "Null", "Timestamp",
+    "Enum", "Range",
+]
+_TYPE_LOOKUP = {t.lower(): t for t in TYPE_OPTIONS}
+
+DEFAULT_FIELDS = [
+    {"id": 0, "name": "_id", "type": "ObjectId", "locked": True, "required": True, "cardinality": "1"},
+]
+
+schemas = load_schemas()
+for _fields in schemas.values():
+    for _f in _fields:
+        _f["type"] = _TYPE_LOOKUP.get(_f.get("type", "String").lower(), _f.get("type", "String"))
+if not schemas:
+    schemas = {"users": copy.deepcopy(DEFAULT_FIELDS)}
+    save_schema("users", schemas["users"])
+
+collections: list[str] = list(schemas.keys())
+current_col: str = collections[0]
+
+gen_settings: dict = {"count": 1000, "seed": 42, "clear_first": True, "target": "tinydb"}
+
+preview_docs: list[dict] = []
+preview_index: int = 0
+
+is_generating: bool = False
+progress_current: int = 0
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def cur_fields() -> list[dict]:
+    return schemas.get(current_col, [])
+
+
+def find_field(fid: int, fields: list | None = None) -> dict | None:
+    if fields is None:
+        fields = cur_fields()
+    for f in fields:
+        if f["id"] == fid:
+            return f
+        if f["type"] == "Object":
+            found = find_field(fid, f.get("fields", []))
+            if found:
+                return found
+    return None
+
+
+def shuffler_weights(values: list, shuffler: int) -> list[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    if shuffler <= 1:
+        return [round(1.0, 2)] * n
+    base = [random.expovariate(1.0) for _ in range(n)]
+    mean = sum(base) / n
+    scaled = [mean + (x - mean) * (shuffler / 10.0) for x in base]
+    total = sum(scaled)
+    return [round(x * n / total, 2) for x in scaled]
+
+
+def json_to_html(obj, indent: int = 0) -> str:
+    pad = "  " * indent
+    ipad = "  " * (indent + 1)
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        lines = ["{"]
+        items = list(obj.items())
+        for i, (k, v) in enumerate(items):
+            comma = "," if i < len(items) - 1 else ""
+            lines.append(f'{ipad}<span class="code-key">"{k}"</span>: {json_to_html(v, indent+1)}{comma}')
+        lines.append(f"{pad}}}")
+        return "\n".join(lines)
+    if isinstance(obj, list):
+        if not obj:
+            return "[]"
+        lines = ["["]
+        for i, v in enumerate(obj):
+            comma = "," if i < len(obj) - 1 else ""
+            lines.append(f"{ipad}{json_to_html(v, indent+1)}{comma}")
+        lines.append(f"{pad}]")
+        return "\n".join(lines)
+    if isinstance(obj, str):
+        if obj.startswith("ObjectId("):
+            return f'<span class="code-comment">{obj}</span>'
+        esc = obj.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f'<span class="code-string">"{esc}"</span>'
+    if isinstance(obj, bool):
+        return f'<span class="code-number">{"true" if obj else "false"}</span>'
+    if isinstance(obj, (int, float)):
+        return f'<span class="code-number">{obj}</span>'
+    if obj is None:
+        return '<span class="code-comment">null</span>'
+    return str(obj)
+
+
+def build_cli_html() -> str:
+    col = current_col
+    count = gen_settings["count"]
+    seed = gen_settings["seed"]
+    target = gen_settings["target"]
+    clear = "\n  <span class='flag'>--clear-first</span>" if gen_settings["clear_first"] else ""
+    return (
+        f"mongodocgen generate <span class='cont'>\\</span>\n"
+        f"  <span class='flag'>--collection</span> <span class='val'>{col}</span> <span class='cont'>\\</span>\n"
+        f"  <span class='flag'>--schema</span> <span class='val'>schemas/{col}.json</span> <span class='cont'>\\</span>\n"
+        f"  <span class='flag'>--count</span> <span class='val'>{count}</span> <span class='cont'>\\</span>\n"
+        f"  <span class='flag'>--seed</span> <span class='val'>{seed}</span> <span class='cont'>\\</span>\n"
+        f"  <span class='flag'>--target</span> <span class='val'>{target}</span>{clear}"
+    )
+
+
+def _change_type(fid: int, new_type) -> None:
+    field = find_field(fid)
+    if not field or field.get("locked"):
+        return
+    new_type = new_type if isinstance(new_type, str) else (new_type or [None])[0]
+    if not new_type or new_type == field["type"]:
+        return
+    # keep name/id/required/cardinality, reset type-specific keys
+    for k in ["faker", "min", "max", "values", "weights", "shuffler",
+              "element_faker", "min_items", "max_items", "fields"]:
+        field.pop(k, None)
+    field["type"] = new_type
+    if new_type == "String":
+        field["faker"] = "word"
+    elif new_type in ("Int32", "Int64"):
+        field.update({"min": 0, "max": 2147483647 if new_type == "Int32" else 9007199254740991})
+    elif new_type == "Double":
+        field.update({"min": 0.0, "max": 1000.0})
+    elif new_type == "Decimal128":
+        field.update({"min": 0.0, "max": 9999.99, "precision": 2})
+    elif new_type == "Range":
+        field.update({"min": 0, "max": 100})
+    elif new_type == "Enum":
+        field.update({"values": ["option1", "option2"], "weights": [1.0, 1.0], "shuffler": 1})
+    elif new_type == "Array":
+        field.update({"element_faker": "word", "min_items": 1, "max_items": 3, "cardinality": "1–3"})
+    elif new_type == "Object":
+        field["fields"] = []
+    save_schema(current_col, schemas[current_col])
+
+
+def update_field_prop(fid: int, key: str, value) -> None:
+    field = find_field(fid)
+    if field and not field.get("locked"):
+        field[key] = value
+        save_schema(current_col, schemas[current_col])
+
+
+def type_label(field: dict) -> str:
+    return field.get("type", "String")
+
+
+def cardinality_of(field: dict) -> str:
+    if field["type"] == "Array":
+        return f"{field.get('min_items',1)}–{field.get('max_items',3)}"
+    return field.get("cardinality", "1")
+
+
+def default_display(field: dict) -> str:
+    t = field["type"]
+    if t == "ObjectId":
+        return '<span class="field-default italic">auto</span>'
+    if t == "String":
+        return '<span class="field-default">""</span>'
+    if t == "Range":
+        return f'<span class="field-default">{field.get("min", 0)} → {field.get("max", 100)}</span>'
+    if t == "Object":
+        return '<span class="field-default">{...}</span>'
+    if t == "Array":
+        return '<span class="field-default">[]</span>'
+    if t == "Enum":
+        vals = field.get("values", [])
+        chips = "".join(f'<span class="chip">{v}</span>' for v in vals)
+        chips += '<span class="chip chip-add">+ add</span>'
+        sh = field.get("shuffler", 1)
+        return f'<div class="chips">{chips}</div><span class="shuffler-chip">🔀 shuffler: {sh}</span>'
+    return ""
+
+
+def tr_class(field: dict) -> str:
+    t = field["type"]
+    return {"Range": "badge-range", "Enum": "badge-enum",
+            "Array": "badge-array", "Object": "badge-object"}.get(t, "")
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+
+APP_CSS = """<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body,.q-page,.q-page-container{background:#f5f1ed!important;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+.q-page{padding:20px!important}
+.q-header{display:none!important}
+.container{max-width:1400px;margin:0 auto}
+.card{background:#fff;border:.5px solid #e0dcd8;border-radius:10px;display:flex;flex-direction:column;height:calc(100vh - 40px);position:relative;overflow:hidden}
+.title-bar{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:.5px solid #e0dcd8;flex-shrink:0}
+.title-left{display:flex;gap:12px;align-items:center}
+.app-icon{width:28px;height:28px;background:linear-gradient(135deg,#6b5b95,#88498f);border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:14px}
+.app-title{font-size:15px;font-weight:500;color:#2a2a2a}
+.title-right{display:flex;gap:8px}
+.pill{padding:6px 12px;border-radius:16px;font-size:12px;font-weight:500}
+.pill-blue{background:#dbeafe;color:#1e40af}
+.pill-teal{background:#ccfbf1;color:#0d9488}
+.pill-purple{background:#e9d5ff;color:#6b21a8}
+.collection-tabs{display:flex;align-items:center;gap:4px;padding:10px 20px;border-bottom:.5px solid #e0dcd8;overflow-x:auto;flex-shrink:0}
+.collection-tab{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:500;color:#888;cursor:pointer;white-space:nowrap;border:none;background:transparent}
+.collection-tab.active{background:#f3f1f0;color:#2a2a2a}
+.collection-tab:hover:not(.active){background:#f9f7f5}
+.collection-tab-add{padding:6px 12px;border-radius:6px;font-size:12px;color:#aaa;border:1px dashed #d0ccc8;cursor:pointer;background:transparent;white-space:nowrap}
+.tabs-spacer{flex:1}
+.save-indicator{font-size:11px;color:#aaa;display:flex;align-items:center;gap:5px;white-space:nowrap}
+.save-indicator.saved{color:#10b981}
+.settings-btn{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:6px;font-size:12px;color:#666;background:#f9f7f5;border:.5px solid #e0dcd8;cursor:pointer;white-space:nowrap}
+.body{display:flex;flex:1;overflow:hidden}
+.left-column{flex:0 0 55%;border-right:.5px solid #e0dcd8;display:flex;flex-direction:column;overflow:hidden}
+.right-column{flex:0 0 45%;display:flex;flex-direction:column;overflow:hidden}
+.column-header{padding:16px 20px 12px;border-bottom:.5px solid #e0dcd8;flex-shrink:0}
+.column-title{font-size:14px;font-weight:600;color:#2a2a2a}
+.column-subtitle{font-size:12px;color:#999;margin-top:4px}
+.table-container{flex:1;overflow-y:auto;padding:0 20px;scrollbar-width:thin;scrollbar-color:#ddd transparent}
+.table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
+.table th{background:transparent;padding:8px 0;text-align:left;font-weight:600;color:#666;border-bottom:.5px solid #e0dcd8;font-size:11px;text-transform:uppercase;letter-spacing:.3px}
+.table td{padding:10px 0;border-bottom:.5px solid #f0ebe8;vertical-align:middle}
+.table tr.nested td{padding-left:32px;border-left:2px solid #d8c5e8;font-size:12px}
+.field-name{font-family:'Monaco','Menlo',monospace;font-size:12px;color:#2a2a2a;font-weight:500}
+.field-type{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666}
+.field-default{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#888}
+.field-default.italic{font-style:italic}
+.badge-range td{background:#dbeafe10}
+.badge-enum td{background:#fce7f310}
+.badge-array td{background:#fef3c710}
+.badge-object td{background:#e9d5ff10}
+.drag-handle{color:#ccc;font-size:12px;cursor:grab;padding-right:8px}
+.req-toggle{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#999;cursor:pointer}
+.req-toggle .dot{width:8px;height:8px;border-radius:50%;background:#ddd;display:inline-block}
+.req-toggle.required{color:#0d9488}
+.req-toggle.required .dot{background:#10b981}
+.icon{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;color:#999;font-size:12px;cursor:pointer}
+.icon.lock{color:#d4a574;cursor:default}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px}
+.chip{background:#f3f1f0;color:#4a4a4a;padding:4px 10px;border-radius:12px;font-size:11px}
+.chip-add{background:transparent;border:1px dashed #d0ccc8;color:#999}
+.shuffler-chip{display:inline-flex;align-items:center;gap:4px;background:#fce7f3;color:#9f1239;padding:3px 9px;border-radius:10px;font-size:10px;font-family:'Monaco','Menlo',monospace}
+.array-meta{font-size:11px;color:#888;margin-top:4px;font-family:'Monaco','Menlo',monospace}
+.action-buttons{display:flex;gap:8px;padding:12px 20px;border-top:.5px solid #e0dcd8;flex-shrink:0;flex-wrap:wrap}
+.btn-action{padding:7px 12px;background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;font-size:12px;color:#4a4a4a;cursor:pointer}
+.btn-action:hover{background:#f0ebe8}
+.preset-row{padding:10px 20px 12px;border-top:.5px solid #e0dcd8;flex-shrink:0}
+.preset-row-label{font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px}
+.preset-chips{display:flex;gap:6px;flex-wrap:wrap}
+.preset-chip{padding:5px 12px;border-radius:12px;font-size:11px;background:#eef2ff;color:#3730a3;cursor:pointer;font-family:'Monaco','Menlo',monospace}
+.preset-chip:hover{background:#e0e7ff}
+.preview-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px 12px;border-bottom:.5px solid #e0dcd8;flex-shrink:0}
+.preview-title{font-size:14px;font-weight:600;color:#2a2a2a}
+.preview-nav{display:flex;align-items:center;gap:8px;font-size:11px;color:#999}
+.nav-arrow{width:22px;height:22px;border:none;background:#f9f7f5;border-radius:4px;cursor:pointer;color:#666;font-size:11px}
+.nav-arrow:hover{background:#f0ebe8}
+.preview-icons{display:flex;gap:8px}
+.icon-btn{width:28px;height:28px;border:none;background:#f9f7f5;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
+.icon-btn:hover{background:#f0ebe8}
+.icon-btn.check{color:#10b981}
+.code-block{flex:1;padding:16px 20px;overflow-y:auto;background:#f9f7f5;border-radius:6px;margin:12px 20px;font-family:'Monaco','Menlo',monospace;font-size:11px;line-height:1.6;scrollbar-width:thin;scrollbar-color:#ddd transparent;white-space:pre-wrap;word-break:break-word}
+.code-key{color:#1e40af}
+.code-string{color:#059669}
+.code-number{color:#d97706}
+.code-comment{color:#999}
+.value-pool{margin:0 20px 12px;padding:12px 14px;background:#fce7f3;border-radius:6px;border:.5px solid #fbcfe8;flex-shrink:0}
+.pool-title{font-size:12px;font-weight:600;color:#9f1239}
+.pool-subtitle{font-size:11px;color:#be185d;margin-top:2px;margin-bottom:8px}
+.shuffler-row{display:flex;flex-direction:column;gap:6px;margin-bottom:12px;padding-bottom:12px;border-bottom:.5px solid #fbcfe8}
+.shuffler-top{display:flex;justify-content:space-between;align-items:baseline}
+.shuffler-name{font-size:11px;font-weight:600;color:#9f1239}
+.shuffler-value{font-size:11px;font-family:'Monaco','Menlo',monospace;color:#be185d}
+.shuffler-slider{width:100%;accent-color:#be185d;height:4px;flex:1}
+.shuffler-labels{display:flex;justify-content:space-between;font-size:10px;color:#be185d;opacity:.7}
+.pool-chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.pool-chip-row{display:flex;align-items:center;gap:8px;background:#fff;border-radius:12px;padding:4px 10px}
+.pool-chip{font-size:11px;color:#be185d}
+.pool-weight{width:38px;border:.5px solid #fbcfe8;border-radius:8px;font-size:10px;text-align:center;color:#be185d;font-family:'Monaco','Menlo',monospace;padding:2px 0;background:#fff}
+.pool-meta{display:flex;gap:12px;font-size:11px;color:#be185d;align-items:center;flex-wrap:wrap}
+.pool-csv-btn{background:#fff;border:.5px solid #fbcfe8;color:#be185d;padding:4px 10px;border-radius:12px;font-size:11px;cursor:pointer}
+.gen-options{display:flex;align-items:center;gap:16px;padding:10px 20px;border-top:.5px solid #e0dcd8;font-size:12px;color:#666;flex-wrap:wrap;flex-shrink:0}
+.gen-option{display:flex;align-items:center;gap:6px}
+.checkbox-fake{width:14px;height:14px;border:.5px solid #d0ccc8;border-radius:3px;display:inline-block;position:relative;cursor:pointer;flex-shrink:0}
+.checkbox-fake.checked{background:#2a2a2a;border-color:#2a2a2a}
+.checkbox-fake.checked::after{content:"✓";color:#fff;font-size:10px;position:absolute;top:-2px;left:1px}
+.seed-input{width:80px;padding:4px 8px;border:.5px solid #e0dcd8;border-radius:4px;font-family:'Monaco','Menlo',monospace;font-size:11px;background:#fff}
+.target-select{display:flex;gap:4px;background:#f3f1f0;border-radius:6px;padding:2px}
+.target-option{padding:4px 10px;border-radius:5px;font-size:11px;color:#888;cursor:pointer}
+.target-option.active{background:#fff;color:#2a2a2a;font-weight:500;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.action-bar{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-top:.5px solid #e0dcd8;flex-shrink:0}
+.docs-input{display:flex;align-items:center;gap:8px}
+.docs-label{font-size:12px;color:#666;font-weight:500}
+.docs-number{width:70px;padding:6px 10px;border:.5px solid #e0dcd8;border-radius:4px;font-family:'Monaco','Menlo',monospace;font-size:12px;text-align:center;background:#fff}
+.status-section{flex:1;text-align:center}
+.status-text{font-size:12px;color:#666}
+.progress-container{display:flex;align-items:center;gap:8px;margin-top:6px;justify-content:center}
+.progress-bar{width:200px;height:4px;background:#e0dcd8;border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;background:#10b981;transition:width .2s}
+.progress-percent{font-size:12px;color:#666;min-width:28px;text-align:right}
+.btn-generate{padding:8px 18px;background:#2a2a2a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:6px}
+.btn-generate:hover{background:#1a1a1a}
+.btn-generate:disabled{background:#999;cursor:not-allowed}
+.btn-pause{padding:8px 14px;background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;font-size:12px;color:#4a4a4a;cursor:pointer}
+.btn-cli{padding:8px 14px;background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;font-size:12px;color:#4a4a4a;cursor:pointer;font-family:'Monaco','Menlo',monospace}
+.bar-right{display:flex;gap:8px}
+.modal-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(42,42,42,.35);display:flex;align-items:center;justify-content:center;border-radius:10px;z-index:10}
+.modal-dialog{background:#fff;border:.5px solid #e0dcd8;border-radius:10px;width:560px;max-width:90%;box-shadow:0 12px 32px rgba(0,0,0,.18)}
+.modal-header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:.5px solid #e0dcd8}
+.modal-title{font-size:14px;font-weight:600;color:#2a2a2a}
+.modal-subtitle{font-size:12px;color:#999;margin-top:2px}
+.modal-close{width:26px;height:26px;border:none;background:#f9f7f5;border-radius:4px;cursor:pointer;color:#666;font-size:13px}
+.modal-close:hover{background:#f0ebe8}
+.modal-body{padding:18px}
+.modal-code{background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;padding:14px 16px;font-family:'Monaco','Menlo',monospace;font-size:12px;line-height:1.7;color:#2a2a2a;overflow-x:auto;white-space:pre}
+.modal-code .flag{color:#1e40af}
+.modal-code .val{color:#059669}
+.modal-code .cont{color:#999}
+.modal-foot{display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:11px;color:#999}
+.modal-copy{display:flex;align-items:center;gap:6px;padding:7px 14px;background:#2a2a2a;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer}
+.modal-copy:hover{background:#1a1a1a}
+.status-ok{color:#10b981;font-size:12px;font-weight:500}
+.schema-header,.schema-row{display:grid;grid-template-columns:20px 1fr 120px 60px 110px 80px 24px;gap:6px;align-items:center;padding:8px 0}
+.schema-header{font-size:11px;text-transform:uppercase;color:#666;font-weight:600;letter-spacing:.3px;border-bottom:.5px solid #e0dcd8}
+.schema-row{border-bottom:.5px solid #f0ebe8;cursor:pointer}
+.schema-row.nested-row{grid-template-columns:20px 1fr 120px 60px 110px 80px 24px;padding-left:32px;border-left:2px solid #d8c5e8;font-size:12px}
+.shuffler-inline{display:flex;align-items:center;gap:4px}
+.shuffler-inline input[type=range]{width:68px;accent-color:#6b5b95;height:3px;cursor:pointer}
+.shuffler-inline .shuf-val{font-size:10px;font-family:'Monaco','Menlo',monospace;color:#6b5b95;min-width:18px}
+.schema-row:hover{background:#fafaf9}
+.schema-row.selected{background:#f0f0ff}
+.schema-row.selected:hover{background:#eaeaff}
+.detail-panel{margin:0 20px 12px;padding:12px 14px;background:#f9f7f5;border-radius:6px;border:.5px solid #e0dcd8;flex-shrink:0}
+.detail-title{font-size:12px;font-weight:600;color:#4a4a4a;margin-bottom:10px}
+.detail-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.detail-row:last-child{margin-bottom:0}
+.detail-label{font-size:11px;color:#888;white-space:nowrap}
+.detail-input{padding:4px 8px;border:.5px solid #e0dcd8;border-radius:4px;font-family:'Monaco','Menlo',monospace;font-size:11px;background:#fff;width:80px}
+.detail-select{padding:4px 8px;border:.5px solid #e0dcd8;border-radius:4px;font-size:11px;background:#fff;color:#4a4a4a}
+.detail-shuffler{width:140px;accent-color:#6b5b95;height:4px}
+.detail-shuffler-val{font-size:11px;font-family:'Monaco','Menlo',monospace;color:#6b5b95;min-width:28px}
+.cell-name .q-field,.cell-card .q-field{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important}
+.cell-name .q-field__native,.cell-card .q-field__native{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important;color:#2a2a2a!important;padding:0!important}
+.cell-name .q-field--borderless .q-field__control,.cell-card .q-field--borderless .q-field__control{padding:0!important;min-height:24px!important}
+.cell-type{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666}
+.cell-req{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#999;cursor:pointer;user-select:none}
+.cell-req .dot{width:8px;height:8px;border-radius:50%;background:#ddd;display:inline-block;flex-shrink:0}
+.cell-req.required{color:#0d9488}
+.cell-req.required .dot{background:#10b981}
+.cell-del{color:#ccc;font-size:14px;cursor:pointer;text-align:center}
+.cell-del:hover{color:#e05c5c}
+</style>"""
+
+QUICK_ADD_PRESETS = [
+    ("full_name",      {"type": "String", "faker": "fullName"}),
+    ("email",          {"type": "String", "faker": "email"}),
+    ("phone",          {"type": "String", "faker": "phone"}),
+    ("date_of_birth",  {"type": "Range",  "min": -20000, "max": -6000}),
+    ("uuid",           {"type": "String", "faker": "uuid"}),
+    ("created_at",     {"type": "String", "faker": "date"}),
+    ("street_address", {"type": "String", "faker": "street"}),
+    ("company",        {"type": "String", "faker": "companyName"}),
+]
+
+# ── Page ──────────────────────────────────────────────────────────────────────
+
+@ui.page("/")
+def index():
+    global current_col, preview_docs, preview_index, selected_field_id
+    global is_generating, progress_current
+
+    ui.add_head_html(APP_CSS)
+
+    saved_label_ref: list = []   # [label_element]
+    cli_modal_ref:   list = []   # [overlay_element]
+
+    # ── Refreshable sections ──────────────────────────────────────────────────
+
+    @ui.refreshable
+    def render_tabs():
+        for col in collections:
+            active = "active" if col == current_col else ""
+            ui.html(f'<button class="collection-tab {active}">{col}</button>') \
+                .on("click", lambda c=col: switch_collection(c))
+        ui.html('<button class="collection-tab-add">+ Collection</button>') \
+            .on("click", add_collection)
+        ui.html('<div class="tabs-spacer"></div>')
+        saved_lbl = ui.html('<div class="save-indicator saved">● saved</div>')
+        saved_label_ref.clear()
+        saved_label_ref.append(saved_lbl)
+        ui.html(
+            f'<button class="settings-btn">⚙ Connection: {gen_settings["target"]} (preview)</button>'
+        )
+
+    @ui.refreshable
+    def render_col_header():
+        ui.html(f'''
+            <div class="column-title">Schema fields</div>
+            <div class="column-subtitle">collection: {current_col}</div>
+        ''')
+
+    @ui.refreshable
+    def render_schema_table():
+        fields = cur_fields()
+
+        def render_row(field, nested: bool = False):
+            locked = field.get("locked", False)
+            fid    = field["id"]
+            req    = field.get("required", False)
+            is_sel = fid == selected_field_id
+            row_cls = "schema-row nested-row" if nested else "schema-row"
+            if is_sel:
+                row_cls += " selected"
+
+            with ui.element("div").classes(row_cls) \
+                    .on("click", lambda f=field: select_field(f["id"])) \
+                    .on("input",  lambda e, f=field: _handle_row_input(e, f["id"])):
+                # drag handle / indent spacer
+                if locked:
+                    ui.html('<span style="width:20px"></span>')
+                else:
+                    ui.html('<span class="drag-handle">⠿</span>')
+
+                # field name — editable input
+                with ui.element("div").classes("cell-name"):
+                    if locked:
+                        ui.html(f'<span class="field-name">{field["name"]}</span>')
+                    else:
+                        inp = ui.input(value=field["name"]).props("dense borderless") \
+                                 .style("font-family:'Monaco','Menlo',monospace;font-size:12px;width:100%")
+                        inp.on("blur",
+                               lambda e, f=field: update_field_prop(f["id"], "name", e.sender.value))
+
+                # type dropdown
+                with ui.element("div").classes("cell-type"):
+                    if locked:
+                        ui.html(type_label(field))
+                    else:
+                        canonical = _TYPE_LOOKUP.get(field["type"].lower(), field["type"])
+                        ui.select(TYPE_OPTIONS, value=canonical) \
+                          .props("dense borderless options-dense") \
+                          .style("font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;min-width:110px") \
+                          .on("update:model-value", lambda e, f=field: [_change_type(f["id"], e.args), render_schema_table.refresh()])
+
+                # cardinality — editable unless array (auto from min/max)
+                with ui.element("div").classes("cell-card"):
+                    if field["type"] == "Array":
+                        ui.html(f'<span style="font-size:11px;color:#888">{cardinality_of(field)}</span>')
+                    elif locked:
+                        ui.html('<span style="font-size:11px;color:#888">1</span>')
+                    else:
+                        cinp = ui.input(value=cardinality_of(field)).props("dense borderless") \
+                                  .style("font-family:'Monaco','Menlo',monospace;font-size:11px;width:60px")
+                        cinp.on("blur",
+                                lambda e, f=field: update_field_prop(f["id"], "cardinality", e.sender.value))
+
+                # shuffler slider (inline)
+                sh = field.get("shuffler", 1)
+                if locked:
+                    ui.html('<span></span>')
+                else:
+                    ui.html(
+                        f'<div class="shuffler-inline">'
+                        f'<input type="range" id="shuf-slider" data-fid="{fid}" min="1" max="50" value="{sh}">'
+                        f'<span class="shuf-val">{sh}</span>'
+                        f'</div>'
+                    )
+
+                # required toggle
+                req_cls = "cell-req required" if req else "cell-req"
+                req_lbl = "required" if req else "optional"
+                tog = ui.html(
+                    f'<span class="{req_cls}"><span class="dot"></span>{req_lbl}</span>'
+                )
+                if not locked:
+                    tog.on("click", lambda f=field: toggle_required(f["id"]))
+
+                # delete
+                if locked:
+                    ui.html('<span class="icon lock" style="font-size:13px">🔒</span>')
+                else:
+                    ui.html('<span class="cell-del">✕</span>') \
+                      .on("click", lambda f=field: delete_field(f["id"]))
+
+        # Header
+        ui.html('''
+        <div class="schema-header">
+            <span></span>
+            <span>Field name</span>
+            <span>Type</span>
+            <span>Card.</span>
+            <span>Shuffler</span>
+            <span>Required</span>
+            <span></span>
+        </div>''')
+
+        for field in fields:
+            render_row(field)
+            if field["type"] == "Object":
+                for sf in field.get("fields", []):
+                    render_row(sf, nested=True)
+                ui.html(
+                    f'<div class="schema-row nested-row" style="padding-left:32px;border-left:2px solid #d8c5e8">'
+                    f'<span></span>'
+                    f'<span class="chip chip-add" style="cursor:pointer" '
+                    f'data-parent="{field["id"]}">+ add nested field</span>'
+                    f'</div>'
+                ).on("click", lambda f=field: add_nested_field(f["id"]))
+
+    @ui.refreshable
+    def render_preview():
+        if not preview_docs:
+            ui.html('<div style="padding:20px;color:#999;font-size:12px">Click ▶ Generate to see a preview.</div>')
+            return
+        doc = preview_docs[preview_index]
+        html_body = json_to_html(doc)
+        ui.html(f'<div class="code-block">{html_body}</div>')
+
+    @ui.refreshable
+    def render_value_pool():
+        if selected_field_id is None:
+            return
+        field = find_field(selected_field_id)
+        if not field or field.get("locked"):
+            return
+        t   = field["type"]
+        fid = field["id"]
+        sh  = field.get("shuffler", 1)
+
+        if t == "String":
+            faker_val = field.get("faker", "word")
+            opts_html = "".join(
+                f'<option value="{f}" {"selected" if f == faker_val else ""}>{f}</option>'
+                for f in FAKER_TYPES
+            )
+            el = ui.html(f'''
+            <div class="detail-panel">
+                <div class="detail-title">String · {field["name"]}</div>
+                <div class="detail-row">
+                    <span class="detail-label">Faker generator</span>
+                    <select class="detail-select" id="faker-sel" data-fid="{fid}">{opts_html}</select>
+                </div>
+            </div>''')
+            el.on("change", handle_detail_change)
+
+        elif t in ("Int32", "Int64", "Double", "Decimal128", "Range"):
+            mn = field.get("min", 0)
+            mx = field.get("max", 100)
+            pr = field.get("precision", 2) if t == "Decimal128" else None
+            prec_row = (
+                f'<span class="detail-label" style="margin-left:12px">Precision</span>'
+                f'<input class="detail-input" id="precision-inp" data-fid="{fid}" value="{pr}" type="number" min="0" max="10" style="width:60px">'
+            ) if pr is not None else ""
+            el = ui.html(f'''
+            <div class="detail-panel">
+                <div class="detail-title">{t} · {field["name"]}</div>
+                <div class="detail-row">
+                    <span class="detail-label">Min</span>
+                    <input class="detail-input" id="min-inp" data-fid="{fid}" value="{mn}" type="number">
+                    <span class="detail-label">Max</span>
+                    <input class="detail-input" id="max-inp" data-fid="{fid}" value="{mx}" type="number">
+                    {prec_row}
+                </div>
+            </div>''')
+            el.on("change", handle_detail_change)
+
+        elif t == "Array":
+            ef  = field.get("element_faker", "word")
+            mi  = field.get("min_items", 1)
+            ma  = field.get("max_items", 3)
+            opts_html = "".join(
+                f'<option value="{f}" {"selected" if f == ef else ""}>{f}</option>'
+                for f in FAKER_TYPES
+            )
+            el = ui.html(f'''
+            <div class="detail-panel">
+                <div class="detail-title">Array · {field["name"]}</div>
+                <div class="detail-row">
+                    <span class="detail-label">Element faker</span>
+                    <select class="detail-select" id="element-faker-sel" data-fid="{fid}">{opts_html}</select>
+                    <span class="detail-label">Min items</span>
+                    <input class="detail-input" id="min-items-inp" data-fid="{fid}" value="{mi}" type="number" min="0" style="width:60px">
+                    <span class="detail-label">Max items</span>
+                    <input class="detail-input" id="max-items-inp" data-fid="{fid}" value="{ma}" type="number" min="1" style="width:60px">
+                </div>
+            </div>''')
+            el.on("change", handle_detail_change)
+
+        elif t == "Enum":
+            vals    = field.get("values", [])
+            weights = field.get("weights", [1.0] * len(vals))
+            n       = len(vals)
+
+            chip_rows = "".join(
+                f'<div class="pool-chip-row">'
+                f'<span class="pool-chip">{v}</span>'
+                f'<input class="pool-weight" value="{w:.2f}" data-vi="{i}" data-fid="{fid}">'
+                f'</div>'
+                for i, (v, w) in enumerate(zip(vals, weights))
+            )
+
+            pool_html = f'''
+            <div class="value-pool">
+                <div class="pool-title">Value pool · {field["name"]}</div>
+                <div class="pool-subtitle">{n} values · shuffler {sh}/50</div>
+                <div class="shuffler-row">
+                    <div class="shuffler-top">
+                        <span class="shuffler-name">🔀 Shuffler</span>
+                        <span class="shuffler-value" id="shuf-val">{sh} / 50</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px">
+                        <input type="range" class="shuffler-slider" min="1" max="50" value="{sh}" id="shuf-slider" data-fid="{fid}">
+                        <button class="pool-csv-btn" id="reroll-btn">🎲 Re-roll</button>
+                    </div>
+                    <div class="shuffler-labels">
+                        <span>1 · equal frequency</span>
+                        <span>50 · skewed / clustered</span>
+                    </div>
+                </div>
+                <div class="pool-chips">{chip_rows}</div>
+                <div class="pool-meta">
+                    <span>⚖️ weights auto-generated · edit to override</span>
+                    <button class="pool-csv-btn">📊 Import CSV</button>
+                </div>
+            </div>'''
+
+            pool_el = ui.html(pool_html)
+            pool_el.on("change", handle_weight_change)
+            pool_el.on("click",  handle_pool_click)
+            pool_el.on("input",  handle_shuffler_input)
+
+        # Boolean/Date/ObjectId/UUID/etc. — no detail panel needed
+
+    @ui.refreshable
+    def render_gen_options():
+        clear_cls  = "checked" if gen_settings["clear_first"] else ""
+        tdb_active = "active" if gen_settings["target"] == "tinydb" else ""
+        mdb_active = "active" if gen_settings["target"] == "mongodb" else ""
+        seed_val   = gen_settings["seed"]
+
+        opt_html = f'''
+        <div class="gen-option">
+            <span class="checkbox-fake {clear_cls}" id="clear-chk"></span>
+            <span>Clear collection before generating</span>
+        </div>
+        <div class="gen-option">
+            <span>Seed</span>
+            <input class="seed-input" value="{seed_val}" id="seed-input" type="number">
+        </div>
+        <div class="gen-option">
+            <span>Write to</span>
+            <div class="target-select">
+                <div class="target-option {tdb_active}" id="target-tinydb">TinyDB (preview)</div>
+                <div class="target-option {mdb_active}" id="target-mongodb">MongoDB</div>
+            </div>
+        </div>'''
+
+        opt_el = ui.html(opt_html)
+        opt_el.on("click",  handle_gen_option_click)
+        opt_el.on("change", handle_seed_change)
+
+    @ui.refreshable
+    def render_action_bar():
+        count     = gen_settings["count"]
+        pct       = int((progress_current / count) * 100) if is_generating and count else 0
+        dis       = "disabled" if is_generating else ""
+        gen_label = "⏸ Pause" if is_generating else "▶ Generate"
+
+        if is_generating:
+            status_html = f'''
+            <div class="status-text">Generating documents · {progress_current:,} / {count:,}</div>
+            <div class="progress-container">
+                <div class="progress-bar"><div class="progress-fill" style="width:{pct}%"></div></div>
+                <div class="progress-percent">{pct}%</div>
+            </div>'''
+        else:
+            done_count = progress_current if progress_current > 0 else 0
+            status_html = (
+                f'<div class="status-text status-ok">✓ {done_count:,} documents generated</div>'
+                if done_count else
+                '<div class="status-text">Ready to generate</div>'
+            )
+
+        bar_html = f'''
+        <div class="docs-input">
+            <span class="docs-label">Documents</span>
+            <input type="number" class="docs-number" value="{count}" id="docs-count" min="1" max="100000">
+        </div>
+        <div class="status-section">{status_html}</div>
+        <div class="bar-right">
+            <button class="btn-cli" id="cli-btn">&lt;/&gt; CLI</button>
+            <button class="btn-pause" id="pause-btn">⏸ Pause</button>
+            <button class="btn-generate" id="gen-btn" {dis}>▶ Generate</button>
+        </div>'''
+
+        bar_el = ui.html(bar_html)
+        bar_el.on("click",  handle_bar_click)
+        bar_el.on("change", handle_count_change)
+
+    # ── CLI modal ─────────────────────────────────────────────────────────────
+
+    def open_cli_modal():
+        cmd_html = build_cli_html()
+        plain_cmd = (
+            f"mongodocgen generate \\\n"
+            f"  --collection {current_col} \\\n"
+            f"  --schema schemas/{current_col}.json \\\n"
+            f"  --count {gen_settings['count']} \\\n"
+            f"  --seed {gen_settings['seed']} \\\n"
+            f"  --target {gen_settings['target']}"
+            + ("\\\n  --clear-first" if gen_settings["clear_first"] else "")
+        )
+        modal_html = f'''
+        <div class="modal-overlay" id="cli-overlay">
+            <div class="modal-dialog">
+                <div class="modal-header">
+                    <div>
+                        <div class="modal-title">Run from the command line</div>
+                        <div class="modal-subtitle">Equivalent to clicking Generate with the current settings</div>
+                    </div>
+                    <button class="modal-close" id="modal-close-btn">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="modal-code">{cmd_html}</div>
+                    <div class="modal-foot">
+                        <span>Updates automatically as you change schema, count, seed, or target</span>
+                        <button class="modal-copy" id="modal-copy-btn">📋 Copy command</button>
+                    </div>
+                </div>
+            </div>
+        </div>'''
+
+        if cli_modal_ref:
+            cli_modal_ref[0].delete()
+            cli_modal_ref.clear()
+
+        with card_el:
+            overlay = ui.html(modal_html)
+            overlay.on("click", handle_modal_click)
+            cli_modal_ref.append(overlay)
+
+        ui.run_javascript(
+            f"window._cliCmd = {json.dumps(plain_cmd)};",
+            timeout=5
+        )
+
+    def close_cli_modal():
+        if cli_modal_ref:
+            cli_modal_ref[0].delete()
+            cli_modal_ref.clear()
+
+    # ── Event handlers ────────────────────────────────────────────────────────
+
+    def switch_collection(col: str):
+        global current_col, preview_docs, preview_index, selected_field_id
+        current_col = col
+        preview_docs = []
+        preview_index = 0
+        selected_field_id = None
+        render_tabs.refresh()
+        render_col_header.refresh()
+        render_schema_table.refresh()
+        render_preview.refresh()
+        render_value_pool.refresh()
+
+    def add_collection():
+        with ui.dialog() as dlg, ui.card().style("padding:20px;min-width:300px;background:#fff"):
+            ui.label("New collection name").style("font-size:14px;font-weight:600;margin-bottom:12px")
+            name_inp = ui.input(placeholder="collection_name") \
+                .props("outlined dense").style("width:100%")
+            with ui.row().style("gap:8px;margin-top:12px;justify-content:flex-end"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                def do_add():
+                    n = (name_inp.value or "").strip().replace(" ", "_")
+                    if n and n not in collections:
+                        import copy as _copy
+                        collections.append(n)
+                        schemas[n] = _copy.deepcopy(DEFAULT_FIELDS)
+                        save_schema(n, schemas[n])
+                        dlg.close()
+                        switch_collection(n)
+                ui.button("Create", on_click=do_add).props("unelevated color=dark")
+        dlg.open()
+
+    def toggle_required(fid: int):
+        field = find_field(fid)
+        if field:
+            field["required"] = not field.get("required", False)
+            _auto_save()
+            render_schema_table.refresh()
+
+    def delete_field(fid: int, parent_id: int | None = None):
+        global selected_field_id
+        fields = cur_fields()
+        if parent_id is not None:
+            parent = find_field(parent_id)
+            if parent:
+                parent["fields"] = [f for f in parent.get("fields", []) if f["id"] != fid]
+        else:
+            schemas[current_col] = [f for f in fields if f["id"] != fid]
+        if selected_field_id == fid:
+            selected_field_id = None
+        _auto_save()
+        render_schema_table.refresh()
+        render_value_pool.refresh()
+
+    def handle_detail_change(e):
+        args   = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id  = target.get("id", "")
+        val    = target.get("value", "")
+        fid_str = str(target.get("dataset", {}).get("fid", ""))
+        if not fid_str.isdigit():
+            return
+        fid   = int(fid_str)
+        field = find_field(fid)
+        if not field:
+            return
+        if el_id == "faker-sel":
+            update_field_prop(fid, "faker", val)
+        elif el_id == "min-inp":
+            try:
+                update_field_prop(fid, "min", float(val) if "." in str(val) else int(val))
+            except ValueError:
+                pass
+        elif el_id == "max-inp":
+            try:
+                update_field_prop(fid, "max", float(val) if "." in str(val) else int(val))
+            except ValueError:
+                pass
+        elif el_id == "precision-inp":
+            try:
+                update_field_prop(fid, "precision", int(val))
+            except ValueError:
+                pass
+        elif el_id == "element-faker-sel":
+            update_field_prop(fid, "element_faker", val)
+        elif el_id == "min-items-inp":
+            try:
+                update_field_prop(fid, "min_items", int(val))
+                update_field_prop(fid, "cardinality", f'{int(val)}–{field.get("max_items", 3)}')
+                render_schema_table.refresh()
+            except ValueError:
+                pass
+        elif el_id == "max-items-inp":
+            try:
+                update_field_prop(fid, "max_items", int(val))
+                update_field_prop(fid, "cardinality", f'{field.get("min_items", 1)}–{int(val)}')
+                render_schema_table.refresh()
+            except ValueError:
+                pass
+
+    def handle_weight_change(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        fid_str = str(target.get("dataset", {}).get("fid", ""))
+        vi_str  = str(target.get("dataset", {}).get("vi", ""))
+        val_str = str(target.get("value", "1.0"))
+        if fid_str.isdigit() and vi_str.isdigit():
+            fid = int(fid_str)
+            vi  = int(vi_str)
+            field = find_field(fid)
+            if field and field["type"] == "Enum":
+                weights = field.get("weights", [])
+                if 0 <= vi < len(weights):
+                    try:
+                        weights[vi] = float(val_str)
+                        _auto_save()
+                    except ValueError:
+                        pass
+
+    def handle_pool_click(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id = target.get("id", "")
+        if el_id == "reroll-btn":
+            field = find_field(selected_field_id)
+            if field and field["type"] == "Enum":
+                sh = field.get("shuffler", 8)
+                field["weights"] = shuffler_weights(field["values"], sh)
+                _auto_save()
+                render_value_pool.refresh()
+
+    def handle_shuffler_input(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id = target.get("id", "")
+        if el_id != "shuf-slider":
+            return
+        try:
+            sh = int(float(target.get("value", 1)))
+        except ValueError:
+            return
+        fid_str = str(target.get("dataset", {}).get("fid", ""))
+        fid = int(fid_str) if fid_str.isdigit() else selected_field_id
+        field = find_field(fid)
+        if not field:
+            return
+        field["shuffler"] = sh
+        if field["type"] == "Enum":
+            field["weights"] = shuffler_weights(field["values"], sh)
+        _auto_save()
+        render_value_pool.refresh()
+        render_schema_table.refresh()
+
+    def handle_gen_option_click(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id = target.get("id", "")
+        if el_id == "clear-chk":
+            gen_settings["clear_first"] = not gen_settings["clear_first"]
+            render_gen_options.refresh()
+        elif el_id == "target-tinydb":
+            gen_settings["target"] = "tinydb"
+            render_gen_options.refresh()
+            render_tabs.refresh()
+        elif el_id == "target-mongodb":
+            gen_settings["target"] = "mongodb"
+            render_gen_options.refresh()
+            render_tabs.refresh()
+
+    def handle_seed_change(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        if target.get("id") == "seed-input":
+            try:
+                gen_settings["seed"] = int(float(target.get("value", 42)))
+            except ValueError:
+                pass
+
+    def handle_count_change(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        if target.get("id") == "docs-count":
+            try:
+                gen_settings["count"] = max(1, int(float(target.get("value", 1000))))
+            except ValueError:
+                pass
+
+    def handle_bar_click(e):
+        global is_generating, progress_current, preview_docs, preview_index
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id  = target.get("id", "")
+        if el_id == "gen-btn":
+            do_generate()
+        elif el_id == "cli-btn":
+            open_cli_modal()
+
+    def handle_modal_click(e):
+        args = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id = target.get("id", "")
+        if el_id in ("modal-close-btn", "cli-overlay"):
+            close_cli_modal()
+        elif el_id == "modal-copy-btn":
+            ui.run_javascript(
+                "navigator.clipboard.writeText(window._cliCmd || '').catch(()=>{})",
+                timeout=5
+            )
+
+    def _handle_row_input(e, fid: int):
+        args   = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        if target.get("id") != "shuf-slider":
+            return
+        try:
+            sh = int(float(target.get("value", 1)))
+        except ValueError:
+            return
+        field = find_field(fid)
+        if not field:
+            return
+        field["shuffler"] = sh
+        if field["type"] == "Enum":
+            field["weights"] = shuffler_weights(field["values"], sh)
+        _auto_save()
+        if selected_field_id == fid:
+            render_value_pool.refresh()
+
+    def select_field(fid: int):
+        global selected_field_id
+        selected_field_id = fid if selected_field_id != fid else None
+        render_value_pool.refresh()
+
+    def do_generate():
+        global is_generating, progress_current, preview_docs, preview_index
+        if is_generating:
+            return
+        fields  = cur_fields()
+        count   = gen_settings["count"]
+        seed    = gen_settings["seed"]
+        clear   = gen_settings["clear_first"]
+        target  = gen_settings["target"]
+
+        is_generating   = True
+        progress_current = 0
+        render_action_bar.refresh()
+
+        # Generate in chunks, updating progress
+        CHUNK = max(1, min(count // 20, 500))
+        all_docs: list[dict] = []
+        random.seed(seed)
+        from faker import Faker as _Faker; _Faker.seed(seed)
+
+        from faker_fields import _gen_value
+
+        def run_chunks():
+            global is_generating, progress_current
+            remaining = count
+            first_chunk = True
+            while remaining > 0:
+                batch_size = min(CHUNK, remaining)
+                batch = [{f["name"]: _gen_value(f) for f in fields} for _ in range(batch_size)]
+                all_docs.extend(batch)
+                remaining -= batch_size
+                progress_current = count - remaining
+                render_action_bar.refresh()
+                if first_chunk:
+                    preview_docs.clear()
+                    preview_docs.extend(all_docs[:5])
+                    preview_index = 0
+                    render_preview.refresh()
+                    first_chunk = False
+
+            if target == "tinydb":
+                insert_documents(current_col, all_docs, clear_first=clear)
+            is_generating = False
+            render_action_bar.refresh()
+
+        import threading
+        t = threading.Thread(target=run_chunks, daemon=True)
+        t.start()
+
+    def prev_sample():
+        global preview_index
+        if preview_docs and preview_index > 0:
+            preview_index -= 1
+            render_preview.refresh()
+
+    def next_sample():
+        global preview_index
+        if preview_docs and preview_index < len(preview_docs) - 1:
+            preview_index += 1
+            render_preview.refresh()
+
+    def add_field_of_type(ftype: str, extra: dict | None = None):
+        ftype = _TYPE_LOOKUP.get(ftype.lower(), ftype)
+        names = {"String": "new_field", "Range": "age", "Enum": "status",
+                 "Array": "tags", "Object": "nested"}
+        field: dict = {"id": _new_id(), "name": names.get(ftype, "field"),
+                       "type": ftype, "required": False, "cardinality": "1"}
+        if ftype == "String":
+            field["faker"] = "word"
+        elif ftype == "Range":
+            field.update({"min": 0, "max": 100})
+        elif ftype == "Enum":
+            field.update({"values": ["option1", "option2"], "weights": [1.0, 1.0], "shuffler": 1})
+        elif ftype == "Array":
+            field.update({"element_faker": "word", "min_items": 1, "max_items": 3, "cardinality": "1–3"})
+        elif ftype == "Object":
+            field["fields"] = []
+        if extra:
+            field.update(extra)
+        cur_fields().append(field)
+        _auto_save()
+        render_schema_table.refresh()
+
+    def add_nested_field(parent_id: int):
+        parent = find_field(parent_id)
+        if parent and parent["type"] == "Object":
+            parent.setdefault("fields", []).append(
+                {"id": _new_id(), "name": "nested_field", "type": "String",
+                 "faker": "word", "required": False, "cardinality": "1"}
+            )
+            _auto_save()
+            render_schema_table.refresh()
+
+    def quick_add(preset_name: str):
+        for name, conf in QUICK_ADD_PRESETS:
+            if name == preset_name:
+                import copy as _copy
+                extra = _copy.deepcopy(conf)
+                ftype = extra.pop("type")
+                extra["name"] = name
+                add_field_of_type(ftype, extra)
+                break
+
+    def _auto_save():
+        save_schema(current_col, schemas[current_col])
+        if saved_label_ref:
+            saved_label_ref[0].set_content('<div class="save-indicator saved">● saved</div>')
+
+    def handle_preview_header_click(e):
+        global preview_index
+        args   = e.args or {}
+        target = args.get("target", {}) if isinstance(args, dict) else {}
+        el_id  = target.get("id", "")
+        if el_id == "nav-prev":
+            prev_sample()
+        elif el_id == "nav-next":
+            next_sample()
+        elif el_id == "regen-btn":
+            do_generate()
+        elif el_id == "copy-btn" and preview_docs:
+            doc = preview_docs[preview_index]
+            js = json.dumps(json.dumps(doc, default=str))
+            ui.run_javascript(f"navigator.clipboard.writeText({js}).catch(()=>{{}})", timeout=5)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    with ui.element("div").classes("container"):
+        with ui.element("div").classes("card") as card_el:
+
+            # Title bar
+            ui.html('''
+            <div class="title-bar">
+                <div class="title-left">
+                    <div class="app-icon">M</div>
+                    <div class="app-title">Mongo document generator</div>
+                </div>
+            </div>''')
+
+            # Collection tabs
+            with ui.element("div").classes("collection-tabs"):
+                render_tabs()
+
+            # Body
+            with ui.element("div").classes("body"):
+
+                # Left column
+                with ui.element("div").classes("left-column"):
+                    with ui.element("div").classes("column-header"):
+                        render_col_header()
+
+                    with ui.element("div").classes("table-container"):
+                        render_schema_table()
+
+                    render_value_pool()
+
+                    # Action buttons
+                    with ui.element("div").classes("action-buttons"):
+                        for label, ftype in [("+ Field", "string"), ("+ Enum", "enum"),
+                                             ("+ Range", "range"), ("+ Array", "array"),
+                                             ("+ Object", "object")]:
+                            ui.html(f'<button class="btn-action">{label}</button>') \
+                                .on("click", lambda t=ftype: add_field_of_type(t))
+
+                    # Preset chips
+                    with ui.element("div").classes("preset-row"):
+                        ui.html('<div class="preset-row-label">Quick-add realistic fields</div>')
+                        with ui.element("div").classes("preset-chips"):
+                            for name, _ in QUICK_ADD_PRESETS:
+                                ui.html(f'<span class="preset-chip">{name}</span>') \
+                                    .on("click", lambda n=name: quick_add(n))
+
+                # Right column
+                with ui.element("div").classes("right-column"):
+                    # Preview header
+                    prev_hdr = ui.html('''
+                    <div class="preview-header">
+                        <div class="preview-title">JSON preview · editable</div>
+                        <div class="preview-nav" id="prev-nav">
+                            <button class="nav-arrow" id="nav-prev">◀</button>
+                            <span id="sample-label">Sample 1 of 5</span>
+                            <button class="nav-arrow" id="nav-next">▶</button>
+                        </div>
+                        <div class="preview-icons">
+                            <button class="icon-btn" id="regen-btn" title="Regenerate">🔄</button>
+                            <button class="icon-btn" id="copy-btn" title="Copy JSON">📋</button>
+                            <button class="icon-btn check" title="Valid">✓</button>
+                        </div>
+                    </div>''')
+                    prev_hdr.on("click", handle_preview_header_click)
+
+                    render_preview()
+
+            # Generation options
+            with ui.element("div").classes("gen-options"):
+                render_gen_options()
+
+            # Action bar
+            with ui.element("div").classes("action-bar"):
+                render_action_bar()
+
+
+
+ui.run(title="Mongo document generator", port=8080, dark=False, reload=False)

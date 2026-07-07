@@ -1,0 +1,15 @@
+[project]
+name = "mongodb-json-generator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "nicegui>=1.4.21",
+    "tinydb>=4.8.0",
+    "faker>=25.0.0",
+]
+
+[project.scripts]
+start = "main:main"
+
+[dependency-groups]
+dev = []

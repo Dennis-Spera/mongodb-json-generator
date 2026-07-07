@@ -1,0 +1,1265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mongo document generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f5f1ed;
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: #ffffff;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 10px;
+            display: flex;
+            flex-direction: column;
+            height: 90vh;
+            box-shadow: none;
+            position: relative;
+        }
+
+        /* Title bar */
+        .title-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 20px;
+            border-bottom: 0.5px solid #e0dcd8;
+        }
+
+        .title-left {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .app-icon {
+            width: 28px;
+            height: 28px;
+            background: linear-gradient(135deg, #6b5b95, #88498f);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .app-title {
+            font-size: 15px;
+            font-weight: 500;
+            color: #2a2a2a;
+        }
+
+        .title-right {
+            display: flex;
+            gap: 8px;
+        }
+
+        .pill {
+            padding: 6px 12px;
+            border-radius: 16px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .pill-blue {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+
+        .pill-teal {
+            background: #ccfbf1;
+            color: #0d9488;
+        }
+
+        .pill-purple {
+            background: #e9d5ff;
+            color: #6b21a8;
+        }
+
+        /* Body */
+        .body {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Left column */
+        .left-column {
+            flex: 0 0 55%;
+            border-right: 0.5px solid #e0dcd8;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .column-header {
+            padding: 16px 20px 12px;
+            border-bottom: 0.5px solid #e0dcd8;
+        }
+
+        .column-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #2a2a2a;
+        }
+
+        .column-subtitle {
+            font-size: 12px;
+            color: #999;
+            margin-top: 4px;
+        }
+
+        .table-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 20px;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            font-size: 13px;
+        }
+
+        .table th {
+            background: transparent;
+            padding: 8px 0;
+            text-align: left;
+            font-weight: 600;
+            color: #666;
+            border-bottom: 0.5px solid #e0dcd8;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .table td {
+            padding: 12px 0;
+            border-bottom: 0.5px solid #f0ebe8;
+            vertical-align: middle;
+        }
+
+        .table tr.nested td {
+            padding-left: 32px;
+            border-left: 2px solid #d8c5e8;
+            font-size: 12px;
+        }
+
+        .field-name {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            color: #2a2a2a;
+            font-weight: 500;
+        }
+
+        .field-type {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+            color: #666;
+        }
+
+        .field-default {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+            color: #888;
+        }
+
+        .field-default.italic {
+            font-style: italic;
+        }
+
+        .badge-range {
+            background: #dbeafe;
+        }
+
+        .badge-enum {
+            background: #fce7f3;
+        }
+
+        .badge-array {
+            background: #fef3c7;
+        }
+
+        .badge-object {
+            background: #e9d5ff;
+        }
+
+        .icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            color: #999;
+            font-size: 12px;
+        }
+
+        .icon.lock {
+            color: #d4a574;
+        }
+
+        .chips {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .chip {
+            background: #f3f1f0;
+            color: #4a4a4a;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+        }
+
+        .chip-add {
+            background: transparent;
+            border: 1px dashed #d0ccc8;
+            color: #999;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+            padding: 16px 20px;
+            border-top: 0.5px solid #e0dcd8;
+        }
+
+        .btn-action {
+            padding: 8px 14px;
+            background: #f9f7f5;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #4a4a4a;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-action:hover {
+            background: #f0ebe8;
+        }
+
+        /* Right column */
+        .right-column {
+            flex: 0 0 45%;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px 12px;
+            border-bottom: 0.5px solid #e0dcd8;
+        }
+
+        .preview-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #2a2a2a;
+        }
+
+        .preview-icons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .icon-btn {
+            width: 28px;
+            height: 28px;
+            border: none;
+            background: #f9f7f5;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 12px;
+        }
+
+        .icon-btn:hover {
+            background: #f0ebe8;
+        }
+
+        .icon-btn.check {
+            color: #10b981;
+        }
+
+        .code-block {
+            flex: 1;
+            padding: 16px 20px;
+            overflow-y: auto;
+            background: #f9f7f5;
+            border-radius: 6px;
+            margin: 0 20px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+
+        .code-line {
+            margin: 2px 0;
+        }
+
+        .code-key {
+            color: #1e40af;
+        }
+
+        .code-string {
+            color: #059669;
+        }
+
+        .code-number {
+            color: #d97706;
+        }
+
+        .code-comment {
+            color: #999;
+        }
+
+        .value-pool {
+            margin: 16px 20px 0 20px;
+            padding: 12px 14px;
+            background: #fce7f3;
+            border-radius: 6px;
+            border: 0.5px solid #fbcfe8;
+        }
+
+        .pool-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #9f1239;
+        }
+
+        .pool-subtitle {
+            font-size: 11px;
+            color: #be185d;
+            margin-top: 2px;
+            margin-bottom: 8px;
+        }
+
+        .pool-chips {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+
+        .pool-chip {
+            background: white;
+            color: #be185d;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+        }
+
+        .pool-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 11px;
+            color: #be185d;
+        }
+
+        /* Bottom action bar */
+        .action-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 20px;
+            border-top: 0.5px solid #e0dcd8;
+        }
+
+        .docs-input {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .docs-label {
+            font-size: 12px;
+            color: #666;
+            font-weight: 500;
+        }
+
+        .docs-number {
+            width: 70px;
+            padding: 6px 10px;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            text-align: center;
+        }
+
+        .status-section {
+            flex: 1;
+            text-align: center;
+        }
+
+        .status-text {
+            font-size: 12px;
+            color: #666;
+        }
+
+        .progress-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 6px;
+        }
+
+        .progress-bar {
+            width: 200px;
+            height: 4px;
+            background: #e0dcd8;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 64%;
+            background: #10b981;
+        }
+
+        .progress-percent {
+            font-size: 12px;
+            color: #666;
+            min-width: 28px;
+            text-align: right;
+        }
+
+        .btn-generate {
+            padding: 8px 18px;
+            background: #2a2a2a;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .btn-generate:hover {
+            background: #1a1a1a;
+        }
+
+        .scrollbar-hide::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .scrollbar-hide::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .scrollbar-hide::-webkit-scrollbar-thumb {
+            background: #ddd;
+            border-radius: 3px;
+        }
+
+        .table-container {
+            scrollbar-width: thin;
+            scrollbar-color: #ddd transparent;
+        }
+
+        .code-block {
+            scrollbar-width: thin;
+            scrollbar-color: #ddd transparent;
+        }
+
+        /* Collection tabs */
+        .collection-tabs {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 10px 20px;
+            border-bottom: 0.5px solid #e0dcd8;
+            overflow-x: auto;
+        }
+
+        .collection-tab {
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            color: #888;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .collection-tab.active {
+            background: #f3f1f0;
+            color: #2a2a2a;
+        }
+
+        .collection-tab-add {
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #aaa;
+            border: 1px dashed #d0ccc8;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .tabs-spacer {
+            flex: 1;
+        }
+
+        .settings-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #666;
+            background: #f9f7f5;
+            border: 0.5px solid #e0dcd8;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        /* Drag handle + reorder */
+        .drag-handle {
+            color: #ccc;
+            font-size: 12px;
+            cursor: grab;
+            padding-right: 8px;
+        }
+
+        /* Required toggle */
+        .req-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: #999;
+            cursor: pointer;
+        }
+
+        .req-toggle .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ddd;
+            display: inline-block;
+        }
+
+        .req-toggle.required .dot {
+            background: #10b981;
+        }
+
+        .req-toggle.required {
+            color: #0d9488;
+        }
+
+        /* Faker presets row */
+        .preset-row {
+            padding: 10px 20px;
+            border-top: 0.5px solid #e0dcd8;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .preset-row-label {
+            font-size: 11px;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .preset-chips {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .preset-chip {
+            padding: 5px 12px;
+            border-radius: 12px;
+            font-size: 11px;
+            background: #eef2ff;
+            color: #3730a3;
+            cursor: pointer;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+
+        /* Array element type sub-row */
+        .array-meta {
+            font-size: 11px;
+            color: #888;
+            margin-top: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+
+        .array-meta select {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 4px;
+            padding: 2px 4px;
+            color: #888;
+            background: white;
+        }
+
+        /* Preview nav + tooltips */
+        .preview-nav {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+            color: #999;
+        }
+
+        .nav-arrow {
+            width: 22px;
+            height: 22px;
+            border: none;
+            background: #f9f7f5;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 11px;
+        }
+
+        .nav-arrow:hover {
+            background: #f0ebe8;
+        }
+
+        /* Value pool weights */
+        .pool-chip-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: white;
+            border-radius: 12px;
+            padding: 4px 10px;
+        }
+
+        .pool-chip-row .pool-chip {
+            padding: 0;
+            background: transparent;
+        }
+
+        .pool-weight {
+            width: 38px;
+            border: 0.5px solid #fbcfe8;
+            border-radius: 8px;
+            font-size: 10px;
+            text-align: center;
+            color: #be185d;
+            font-family: 'Monaco', 'Menlo', monospace;
+            padding: 2px 0;
+        }
+
+        .pool-chips {
+            align-items: center;
+        }
+
+        .pool-csv-btn {
+            background: white;
+            border: 0.5px solid #fbcfe8;
+            color: #be185d;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        /* Generation options row */
+        .gen-options {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 10px 20px;
+            border-top: 0.5px solid #e0dcd8;
+            font-size: 12px;
+            color: #666;
+            flex-wrap: wrap;
+        }
+
+        .gen-option {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .checkbox-fake {
+            width: 14px;
+            height: 14px;
+            border: 0.5px solid #d0ccc8;
+            border-radius: 3px;
+            display: inline-block;
+            position: relative;
+        }
+
+        .checkbox-fake.checked {
+            background: #2a2a2a;
+            border-color: #2a2a2a;
+        }
+
+        .checkbox-fake.checked::after {
+            content: "✓";
+            color: white;
+            font-size: 10px;
+            position: absolute;
+            top: -2px;
+            left: 1px;
+        }
+
+        .seed-input {
+            width: 90px;
+            padding: 4px 8px;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+        }
+
+        .target-select {
+            display: flex;
+            gap: 4px;
+            background: #f3f1f0;
+            border-radius: 6px;
+            padding: 2px;
+        }
+
+        .target-option {
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 11px;
+            color: #888;
+            cursor: pointer;
+        }
+
+        .target-option.active {
+            background: white;
+            color: #2a2a2a;
+            font-weight: 500;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        }
+
+        /* Bottom bar additions */
+        .btn-pause {
+            padding: 8px 14px;
+            background: #f9f7f5;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #4a4a4a;
+            cursor: pointer;
+        }
+
+        .save-indicator {
+            font-size: 11px;
+            color: #aaa;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        /* Shuffler control */
+        .shuffler-row {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 0.5px solid #fbcfe8;
+        }
+
+        .shuffler-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+
+        .shuffler-name {
+            font-size: 11px;
+            font-weight: 600;
+            color: #9f1239;
+        }
+
+        .shuffler-value {
+            font-size: 11px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            color: #be185d;
+        }
+
+        .shuffler-slider {
+            width: 100%;
+            accent-color: #be185d;
+            height: 4px;
+        }
+
+        .shuffler-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: #be185d;
+            opacity: 0.7;
+        }
+
+        .shuffler-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: #fce7f3;
+            color: #9f1239;
+            padding: 3px 9px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            margin-top: 6px;
+        }
+
+        /* CLI popup */
+        .btn-cli {
+            padding: 8px 14px;
+            background: #f9f7f5;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #4a4a4a;
+            cursor: pointer;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+
+        .modal-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(42, 42, 42, 0.35);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 10px;
+            z-index: 10;
+        }
+
+        .modal-dialog {
+            background: #ffffff;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 10px;
+            width: 560px;
+            max-width: 90%;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            border-bottom: 0.5px solid #e0dcd8;
+        }
+
+        .modal-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #2a2a2a;
+        }
+
+        .modal-subtitle {
+            font-size: 12px;
+            color: #999;
+            margin-top: 2px;
+        }
+
+        .modal-close {
+            width: 26px;
+            height: 26px;
+            border: none;
+            background: #f9f7f5;
+            border-radius: 4px;
+            cursor: pointer;
+            color: #666;
+            font-size: 13px;
+        }
+
+        .modal-close:hover {
+            background: #f0ebe8;
+        }
+
+        .modal-body {
+            padding: 18px;
+        }
+
+        .modal-code {
+            background: #f9f7f5;
+            border: 0.5px solid #e0dcd8;
+            border-radius: 6px;
+            padding: 14px 16px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            line-height: 1.7;
+            color: #2a2a2a;
+            overflow-x: auto;
+            white-space: pre;
+        }
+
+        .modal-code .flag {
+            color: #1e40af;
+        }
+
+        .modal-code .val {
+            color: #059669;
+        }
+
+        .modal-code .cont {
+            color: #999;
+        }
+
+        .modal-foot {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 12px;
+            font-size: 11px;
+            color: #999;
+        }
+
+        .modal-copy {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 14px;
+            background: #2a2a2a;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .modal-copy:hover {
+            background: #1a1a1a;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <!-- Title bar -->
+            <div class="title-bar">
+                <div class="title-left">
+                    <div class="app-icon">M</div>
+                    <div class="app-title">Mongo document generator</div>
+                </div>
+                <div class="title-right">
+                    <div class="pill pill-blue">NiceGUI</div>
+                    <div class="pill pill-teal">TinyDB</div>
+                    <div class="pill pill-purple">MongoDB</div>
+                </div>
+            </div>
+
+            <!-- Collection tabs -->
+            <div class="collection-tabs">
+                <div class="collection-tab active">users</div>
+                <div class="collection-tab">products</div>
+                <div class="collection-tab">orders</div>
+                <div class="collection-tab-add">+ Collection</div>
+                <div class="tabs-spacer"></div>
+                <div class="save-indicator">● saved</div>
+                <div class="settings-btn">⚙ Connection: tinydb (preview)</div>
+            </div>
+
+            <!-- Body -->
+            <div class="body">
+                <!-- Left column: Schema fields -->
+                <div class="left-column">
+                    <div class="column-header">
+                        <div class="column-title">Schema fields</div>
+                        <div class="column-subtitle">collection: users</div>
+                    </div>
+                    <div class="table-container scrollbar-hide">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th></th>
+                                    <th>Field name</th>
+                                    <th>Type</th>
+                                    <th>Default / values</th>
+                                    <th>Cardinality</th>
+                                    <th>Required</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td></td>
+                                    <td><span class="field-name">_id</span></td>
+                                    <td><span class="field-type">ObjectId</span></td>
+                                    <td><span class="field-default italic">auto</span></td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle required"><span class="dot"></span>required</span></td>
+                                    <td><span class="icon lock">🔒</span></td>
+                                </tr>
+                                <tr>
+                                    <td><span class="drag-handle">⠿</span></td>
+                                    <td><span class="field-name">username</span></td>
+                                    <td><span class="field-type">string</span></td>
+                                    <td><span class="field-default">""</span></td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle required"><span class="dot"></span>required</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="badge-range">
+                                    <td><span class="drag-handle">⠿</span></td>
+                                    <td><span class="field-name">age</span></td>
+                                    <td><span class="field-type">range&lt;int&gt;</span></td>
+                                    <td><span class="field-default">18 → 75</span></td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle"><span class="dot"></span>optional</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="badge-enum">
+                                    <td><span class="drag-handle">⠿</span></td>
+                                    <td><span class="field-name">profession</span></td>
+                                    <td><span class="field-type">enum&lt;string&gt;</span></td>
+                                    <td>
+                                        <div class="chips">
+                                            <span class="chip">doctor</span>
+                                            <span class="chip">teacher</span>
+                                            <span class="chip">engineer</span>
+                                            <span class="chip">designer</span>
+                                            <span class="chip">analyst</span>
+                                            <span class="chip chip-add">+ add</span>
+                                        </div>
+                                        <span class="shuffler-chip">🔀 shuffler: 8</span>
+                                    </td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle required"><span class="dot"></span>required</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="badge-array">
+                                    <td><span class="drag-handle">⠿</span></td>
+                                    <td><span class="field-name">tags</span></td>
+                                    <td>
+                                        <span class="field-type">array&lt;string&gt;</span>
+                                        <div class="array-meta">elements: <select><option>string (free text)</option><option selected>string (from pool)</option><option>enum</option><option>object</option></select></div>
+                                        <span class="shuffler-chip">🔀 shuffler: 25</span>
+                                    </td>
+                                    <td><span class="field-default">[]</span></td>
+                                    <td>2–5</td>
+                                    <td><span class="req-toggle"><span class="dot"></span>optional</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="badge-object">
+                                    <td><span class="drag-handle">⠿</span></td>
+                                    <td><span class="field-name">address</span></td>
+                                    <td><span class="field-type">object</span></td>
+                                    <td><span class="field-default">{...}</span></td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle"><span class="dot"></span>optional</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="nested">
+                                    <td></td>
+                                    <td><span class="field-name">city</span></td>
+                                    <td><span class="field-type">string</span></td>
+                                    <td><span class="field-default">""</span></td>
+                                    <td>1</td>
+                                    <td><span class="req-toggle"><span class="dot"></span>optional</span></td>
+                                    <td><span class="icon">🗑</span></td>
+                                </tr>
+                                <tr class="nested">
+                                    <td></td>
+                                    <td><span class="chip chip-add">+ add nested field</span></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="action-buttons">
+                        <button class="btn-action">+ Field</button>
+                        <button class="btn-action">+ Enum</button>
+                        <button class="btn-action">+ Range</button>
+                        <button class="btn-action">+ Array</button>
+                        <button class="btn-action">+ Object</button>
+                        <button class="btn-action">+ Reference</button>
+                    </div>
+                    <div class="preset-row">
+                        <div class="preset-row-label">Quick-add realistic fields</div>
+                        <div class="preset-chips">
+                            <span class="preset-chip">full_name</span>
+                            <span class="preset-chip">email</span>
+                            <span class="preset-chip">phone</span>
+                            <span class="preset-chip">date_of_birth</span>
+                            <span class="preset-chip">uuid</span>
+                            <span class="preset-chip">created_at</span>
+                            <span class="preset-chip">street_address</span>
+                            <span class="preset-chip">company</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right column: JSON preview -->
+                <div class="right-column">
+                    <div class="preview-header">
+                        <div class="preview-title">JSON preview · editable</div>
+                        <div class="preview-nav">
+                            <button class="nav-arrow" title="Previous sample">◀</button>
+                            <span>Sample 1 of 5</span>
+                            <button class="nav-arrow" title="Next sample">▶</button>
+                        </div>
+                        <div class="preview-icons">
+                            <button class="icon-btn" title="Regenerate this sample">🔄</button>
+                            <button class="icon-btn" title="Copy JSON">📋</button>
+                            <button class="icon-btn check" title="Validate against schema">✓</button>
+                        </div>
+                    </div>
+                    <div class="code-block scrollbar-hide">
+                        <div class="code-line">{</div>
+                        <div class="code-line">  <span class="code-key">"_id"</span>: ObjectId("507f1f77bcf86cd799439011"),</div>
+                        <div class="code-line">  <span class="code-key">"username"</span>: <span class="code-string">"jacqueline_harris"</span>,</div>
+                        <div class="code-line">  <span class="code-key">"age"</span>: <span class="code-number">32</span>, <span class="code-comment">// picked from 18–75</span></div>
+                        <div class="code-line">  <span class="code-key">"profession"</span>: <span class="code-string">"engineer"</span>, <span class="code-comment">// from pool of 5</span></div>
+                        <div class="code-line">  <span class="code-key">"tags"</span>: [<span class="code-string">"backend"</span>, <span class="code-string">"python"</span>],</div>
+                        <div class="code-line">  <span class="code-key">"address"</span>: {</div>
+                        <div class="code-line">    <span class="code-key">"city"</span>: <span class="code-string">"Portland"</span></div>
+                        <div class="code-line">  }</div>
+                        <div class="code-line">}</div>
+                    </div>
+                    <div class="value-pool">
+                        <div class="pool-title">Value pool · profession</div>
+                        <div class="pool-subtitle">5 values · shuffler 8/50 · mildly skewed</div>
+                        <div class="shuffler-row">
+                            <div class="shuffler-top">
+                                <span class="shuffler-name">🔀 Shuffler</span>
+                                <span class="shuffler-value">8 / 50</span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <input type="range" class="shuffler-slider" min="1" max="50" value="8" style="flex: 1;">
+                                <button class="pool-csv-btn" title="Re-roll weights at current shuffler level">🎲 Re-roll</button>
+                            </div>
+                            <div class="shuffler-labels">
+                                <span>1 · equal frequency</span>
+                                <span>50 · skewed / clustered</span>
+                            </div>
+                        </div>
+                        <div class="pool-chips">
+                            <div class="pool-chip-row"><span class="pool-chip">doctor</span><input class="pool-weight" value="0.9"></div>
+                            <div class="pool-chip-row"><span class="pool-chip">teacher</span><input class="pool-weight" value="1.1"></div>
+                            <div class="pool-chip-row"><span class="pool-chip">engineer</span><input class="pool-weight" value="1.6"></div>
+                            <div class="pool-chip-row"><span class="pool-chip">designer</span><input class="pool-weight" value="0.7"></div>
+                            <div class="pool-chip-row"><span class="pool-chip">analyst</span><input class="pool-weight" value="0.7"></div>
+                        </div>
+                        <div class="pool-meta">
+                            <span>⚖️ weights auto-generated from shuffler · edit to override</span>
+                            <button class="pool-csv-btn">📊 Import CSV</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Generation options -->
+            <div class="gen-options">
+                <div class="gen-option">
+                    <span class="checkbox-fake checked"></span>
+                    <span>Clear collection before generating</span>
+                </div>
+                <div class="gen-option">
+                    <span>Seed</span>
+                    <input class="seed-input" value="42">
+                </div>
+                <div class="gen-option">
+                    <span>Write to</span>
+                    <div class="target-select">
+                        <div class="target-option active">TinyDB (preview)</div>
+                        <div class="target-option">MongoDB</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom action bar -->
+            <div class="action-bar">
+                <div class="docs-input">
+                    <span class="docs-label">Documents</span>
+                    <input type="number" class="docs-number" value="1000">
+                </div>
+                <div class="status-section">
+                    <div class="status-text">Generating documents · 642 / 1000</div>
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill"></div>
+                        </div>
+                        <div class="progress-percent">64%</div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn-cli">&lt;/&gt; CLI</button>
+                    <button class="btn-pause">⏸ Pause</button>
+                    <button class="btn-generate">▶ Generate</button>
+                </div>
+            </div>
+
+            <!-- CLI command popup -->
+            <div class="modal-overlay">
+                <div class="modal-dialog">
+                    <div class="modal-header">
+                        <div>
+                            <div class="modal-title">Run from the command line</div>
+                            <div class="modal-subtitle">Equivalent to clicking Generate with the current settings</div>
+                        </div>
+                        <button class="modal-close">✕</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="modal-code">mongodocgen generate <span class="cont">\</span>
+  <span class="flag">--collection</span> <span class="val">users</span> <span class="cont">\</span>
+  <span class="flag">--schema</span> <span class="val">schema/users.json</span> <span class="cont">\</span>
+  <span class="flag">--count</span> <span class="val">1000</span> <span class="cont">\</span>
+  <span class="flag">--seed</span> <span class="val">42</span> <span class="cont">\</span>
+  <span class="flag">--target</span> <span class="val">tinydb</span> <span class="cont">\</span>
+  <span class="flag">--clear-first</span></div>
+                        <div class="modal-foot">
+                            <span>Updates automatically as you change schema, document count, seed, or target</span>
+                            <button class="modal-copy">📋 Copy command</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
