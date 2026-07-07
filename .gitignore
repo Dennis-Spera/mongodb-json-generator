@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 db/
 schemas/
+*.tmp
+*.tmp.*
+*.swp
+*~

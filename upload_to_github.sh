@@ -68,6 +68,9 @@ fi
 echo "Staging changes..."
 git add -A
 
+# Safety net: unstage known temporary/editor artifacts.
+git reset -q HEAD -- '*.tmp' '*.tmp.*' '*.swp' '*~' || true
+
 echo "Creating commit..."
 git commit -m "$COMMIT_MESSAGE"
 
