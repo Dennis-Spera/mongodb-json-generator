@@ -48,6 +48,26 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
+GIT_USER_NAME="$(git config --get user.name || true)"
+GIT_USER_EMAIL="$(git config --get user.email || true)"
+
+if [ -z "$GIT_USER_NAME" ] || [ -z "$GIT_USER_EMAIL" ]; then
+  echo "Error: Git author identity is not configured."
+  echo "Run one of the following:"
+  echo "  git config --global user.name \"Your Name\""
+  echo "  git config --global user.email \"you@example.com\""
+  echo "Or set it only for this repo:"
+  echo "  git config user.name \"Your Name\""
+  echo "  git config user.email \"you@example.com\""
+  exit 1
+fi
+
+# Ensure commit identity is available even if shell env vars are empty.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$GIT_USER_NAME}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-$GIT_USER_EMAIL}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_USER_NAME}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_USER_EMAIL}"
+
 if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
   echo "No changes detected. Nothing to commit."
   exit 0
