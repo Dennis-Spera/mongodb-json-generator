@@ -1,10 +1,11 @@
 import copy
 import json
 import random
+import socket
 from pathlib import Path
 
 from nicegui import ui, run
-from faker_fields import generate_documents, FAKER_TYPES
+from faker_fields import generate_documents
 from schema_store import load_schemas, save_schema, delete_schema
 
 OUTPUT_DIR  = Path(__file__).parent / "output"
@@ -28,6 +29,73 @@ TYPE_OPTIONS = [
     "Enum", "Range",
 ]
 _TYPE_LOOKUP = {t.lower(): t for t in TYPE_OPTIONS}
+ARRAY_ELEMENT_TYPE_OPTIONS = [
+    "String", "Int32", "Int64", "Double", "Decimal128",
+    "Boolean", "Date", "ObjectId", "UUID", "Binary", "Null", "Timestamp",
+]
+
+
+def _canonical_type(value) -> str:
+    if isinstance(value, str):
+        candidate = value
+    elif isinstance(value, int):
+        candidate = TYPE_OPTIONS[value] if 0 <= value < len(TYPE_OPTIONS) else "String"
+    elif isinstance(value, dict):
+        target = value.get("target") if isinstance(value.get("target"), dict) else {}
+        candidate = (
+            value.get("value")
+            or value.get("label")
+            or value.get("model")
+            or target.get("value")
+            or "String"
+        )
+    elif isinstance(value, (list, tuple)):
+        candidate = value[0] if value else "String"
+    else:
+        candidate = "String"
+    if not isinstance(candidate, str):
+        candidate = "String"
+    return _TYPE_LOOKUP.get(candidate.lower(), candidate)
+
+
+def _normalize_field_types(fields: list[dict]) -> None:
+    for field in fields:
+        field["type"] = _canonical_type(field.get("type", "String"))
+        if field["type"] == "Object":
+            _normalize_field_types(field.get("fields", []))
+
+
+def _array_element_type_default(field: dict) -> str:
+    element_type = field.get("element_type")
+    if isinstance(element_type, str) and element_type in ARRAY_ELEMENT_TYPE_OPTIONS:
+        return element_type
+    # Legacy mapping from element_faker to new element_type.
+    faker = field.get("element_faker", "")
+    if faker == "uuid":
+        return "UUID"
+    if faker == "number":
+        return "Int32"
+    if faker == "boolean":
+        return "Boolean"
+    if faker == "date":
+        return "Date"
+    return "String"
+
+
+def _array_size_default(field: dict) -> int:
+    if "size" in field:
+        try:
+            return max(0, int(field.get("size", 1)))
+        except (TypeError, ValueError):
+            return 1
+    try:
+        min_items = int(field.get("min_items", 1))
+        max_items = int(field.get("max_items", min_items))
+        if min_items == max_items:
+            return max(0, min_items)
+    except (TypeError, ValueError):
+        pass
+    return 1
 
 DEFAULT_FIELDS = [
     {"id": 0, "name": "_id", "type": "ObjectId", "locked": True, "required": True, "cardinality": "1"},
@@ -35,8 +103,7 @@ DEFAULT_FIELDS = [
 
 schemas = load_schemas()
 for _fields in schemas.values():
-    for _f in _fields:
-        _f["type"] = _TYPE_LOOKUP.get(_f.get("type", "String").lower(), _f.get("type", "String"))
+    _normalize_field_types(_fields)
 if not schemas:
     schemas = {"users": copy.deepcopy(DEFAULT_FIELDS)}
     save_schema("users", schemas["users"])
@@ -53,6 +120,14 @@ is_generating: bool = False
 progress_current: int = 0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def find_open_port(start_port: int = 8080, max_tries: int = 100) -> int:
+    for port in range(start_port, start_port + max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError(f"No open port found in range {start_port}-{start_port + max_tries - 1}")
 
 def cur_fields() -> list[dict]:
     return schemas.get(current_col, [])
@@ -139,12 +214,12 @@ def _change_type(fid: int, new_type) -> None:
     field = find_field(fid)
     if not field or field.get("locked"):
         return
-    new_type = new_type if isinstance(new_type, str) else (new_type or [None])[0]
+    new_type = _canonical_type(new_type)
     if not new_type or new_type == field["type"]:
         return
     # keep name/id/required/cardinality, reset type-specific keys
     for k in ["faker", "min", "max", "values", "weights", "shuffler",
-              "element_faker", "min_items", "max_items", "fields"]:
+              "element_faker", "element_type", "size", "seed_values", "seed_randomize", "min_items", "max_items", "fields"]:
         field.pop(k, None)
     field["type"] = new_type
     if new_type == "String":
@@ -160,7 +235,7 @@ def _change_type(fid: int, new_type) -> None:
     elif new_type == "Enum":
         field.update({"values": ["option1", "option2"], "weights": [1.0, 1.0], "shuffler": 1})
     elif new_type == "Array":
-        field.update({"element_faker": "word", "min_items": 1, "max_items": 3, "cardinality": "1–3"})
+        field.update({"element_type": "String", "size": 1, "seed_randomize": False, "cardinality": "1"})
     elif new_type == "Object":
         field["fields"] = []
     save_schema(current_col, schemas[current_col])
@@ -179,7 +254,7 @@ def type_label(field: dict) -> str:
 
 def cardinality_of(field: dict) -> str:
     if field["type"] == "Array":
-        return f"{field.get('min_items',1)}–{field.get('max_items',3)}"
+        return str(_array_size_default(field))
     return field.get("cardinality", "1")
 
 
@@ -473,7 +548,10 @@ def index():
                         ui.select(TYPE_OPTIONS, value=canonical) \
                           .props("dense borderless options-dense") \
                           .style("font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;min-width:110px") \
-                          .on("update:model-value", lambda e, f=field: [_change_type(f["id"], e.args), render_schema_table.refresh()])
+                          .on("update:model-value", lambda e, f=field: [_change_type(f["id"], e.sender.value), render_schema_table.refresh()])
+                        if field["type"] == "Array":
+                            ui.html('<span class="chip" style="margin-left:6px;cursor:pointer">⚙ Array</span>') \
+                              .on("click", lambda f=field: open_array_settings_dialog(f["id"]))
 
                 # cardinality — editable unless array (auto from min/max)
                 with ui.element("div").classes("cell-card"):
@@ -604,6 +682,86 @@ def index():
         ui.html(f'<div class="status-section" style="flex:1;text-align:center">{status_html}</div>')
 
     # ── Settings dialog ───────────────────────────────────────────────────────
+
+    def open_array_settings_dialog(fid: int):
+        field = find_field(fid)
+        if not field or field.get("type") != "Array":
+            return
+        with ui.dialog().props("persistent") as dlg:
+            with ui.element("div").style(
+                "width:520px;max-width:90vw;background:#fff;border-radius:10px;"
+                "border:.5px solid #e0dcd8;box-shadow:0 12px 32px rgba(0,0,0,.18);"
+                "display:flex;flex-direction:column;overflow:hidden"
+            ):
+                with ui.element("div").style(
+                    "display:flex;justify-content:space-between;align-items:center;"
+                    "padding:14px 18px;border-bottom:.5px solid #e0dcd8"
+                ):
+                    ui.html(f'<div class="modal-title">Array settings · {field.get("name", "field")}</div>')
+                    ui.button("✕", on_click=dlg.close).props("flat dense round") \
+                        .style("color:#666;font-size:13px;min-width:28px;height:28px")
+
+                with ui.element("div").style("padding:18px;display:flex;flex-direction:column;gap:12px"):
+                    ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600">Element type</div>')
+                    element_type = ui.select(
+                        ARRAY_ELEMENT_TYPE_OPTIONS,
+                        value=_array_element_type_default(field),
+                    ).props("outlined dense") \
+                     .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
+
+                    ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600">Size</div>')
+                    size_inp = ui.input(value=str(_array_size_default(field))) \
+                        .props("outlined dense type=number") \
+                        .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
+
+                    seed_default = ", ".join(str(v) for v in field.get("seed_values", []))
+                    ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600">Seed values (comma-separated)</div>')
+                    seed_values_inp = ui.input(value=seed_default, placeholder="a, b, c") \
+                        .props("outlined dense") \
+                        .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
+
+                    randomize_default = bool(field.get("seed_randomize", False))
+                    randomize_seed_chk = ui.checkbox("Randomize seed values", value=randomize_default) \
+                        .style("font-size:12px;color:#555")
+
+                with ui.element("div").style("display:flex;justify-content:flex-end;gap:8px;padding:12px 18px 18px"):
+                    ui.button("Cancel", on_click=dlg.close).props("flat no-caps") \
+                        .style("color:#666;font-size:12px")
+
+                    def save_array_settings():
+                        arr = find_field(fid)
+                        if not arr or arr.get("type") != "Array":
+                            dlg.close()
+                            return
+
+                        try:
+                            size = max(0, int(float((size_inp.value or "1").strip())))
+                        except ValueError:
+                            size = 1
+
+                        arr["element_type"] = element_type.value or "String"
+                        arr["size"] = size
+                        raw_seed_values = (seed_values_inp.value or "").strip()
+                        if raw_seed_values:
+                            arr["seed_values"] = [
+                                token.strip() for token in raw_seed_values.split(",") if token.strip()
+                            ]
+                            arr["seed_randomize"] = bool(randomize_seed_chk.value)
+                        else:
+                            arr.pop("seed_values", None)
+                            arr.pop("seed_randomize", None)
+                        # Remove legacy keys from older schema format.
+                        arr.pop("element_faker", None)
+                        arr.pop("min_items", None)
+                        arr.pop("max_items", None)
+                        arr["cardinality"] = str(size)
+                        _auto_save()
+                        render_schema_table.refresh()
+                        dlg.close()
+
+                    ui.button("Save", on_click=save_array_settings).props("no-caps unelevated") \
+                        .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px;padding:7px 18px;box-shadow:none")
+        dlg.open()
 
     def open_settings_dialog():
         global OUTPUT_DIR, OUTPUT_FILENAME
@@ -891,7 +1049,7 @@ def index():
         elif ftype == "Enum":
             field.update({"values": ["option1", "option2"], "weights": [1.0, 1.0], "shuffler": 1})
         elif ftype == "Array":
-            field.update({"element_faker": "word", "min_items": 1, "max_items": 3, "cardinality": "1–3"})
+            field.update({"element_type": "String", "size": 1, "seed_randomize": False, "cardinality": "1"})
         elif ftype == "Object":
             field["fields"] = []
         if extra:
@@ -1016,4 +1174,4 @@ def index():
 
 
 
-ui.run(title="Mongo document generator", port=8080, dark=False, reload=False)
+ui.run(title="Mongo document generator", port=find_open_port(8080), dark=False, reload=False)

@@ -7,6 +7,7 @@ FAKER_TYPES = [
     "firstName", "lastName", "fullName", "email", "phone", "username", "password",
     "jobTitle", "street", "city", "state", "country", "zipCode", "latitude", "longitude",
     "companyName", "productName", "price", "date", "uuid", "number", "boolean",
+    "accountNumber",
     "word", "sentence", "paragraph", "color", "url", "ipAddress", "userAgent",
 ]
 
@@ -33,6 +34,7 @@ _MAP: dict = {
     "uuid":        lambda: _fake.uuid4(),
     "number":      lambda: _fake.random_int(min=1, max=1000),
     "boolean":     lambda: _fake.boolean(),
+    "accountNumber": lambda: _fake.numerify(text="############"),
     "word":        lambda: _fake.word(),
     "sentence":    lambda: _fake.sentence(),
     "paragraph":   lambda: _fake.paragraph(),
@@ -41,6 +43,25 @@ _MAP: dict = {
     "ipAddress":   lambda: _fake.ipv4(),
     "userAgent":   lambda: _fake.user_agent(),
 }
+
+
+def _coerce_seed_value(value, element_type: str):
+    text = str(value).strip()
+    if element_type in ("Int32", "Int64", "Timestamp"):
+        try:
+            return int(float(text))
+        except ValueError:
+            return 0
+    if element_type in ("Double", "Decimal128"):
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+    if element_type == "Boolean":
+        return text.lower() in ("1", "true", "t", "yes", "y", "on")
+    if element_type == "Null":
+        return None
+    return text
 
 
 def _gen_value(field: dict):
@@ -86,7 +107,33 @@ def _gen_value(field: dict):
             return random.choices(vals, weights=wts, k=1)[0]
         return random.choice(vals)
     if t == "Array":
-        n  = random.randint(int(field.get("min_items", 1)), int(field.get("max_items", 3)))
+        # New schema model: element_type + size
+        if "size" in field:
+            try:
+                n = max(0, int(field.get("size", 1)))
+            except (TypeError, ValueError):
+                n = 1
+        else:
+            # Backward compatibility with older min/max model.
+            n = random.randint(int(field.get("min_items", 1)), int(field.get("max_items", 3)))
+
+        element_type = field.get("element_type")
+        if isinstance(element_type, str):
+            safe_type = element_type if element_type not in ("Array", "Object") else "String"
+
+            seed_values = field.get("seed_values")
+            if isinstance(seed_values, str):
+                seed_values = [v.strip() for v in seed_values.split(",") if v.strip()]
+            if isinstance(seed_values, list) and seed_values:
+                coerced = [_coerce_seed_value(v, safe_type) for v in seed_values]
+                if coerced:
+                    if bool(field.get("seed_randomize", False)):
+                        return [random.choice(coerced) for _ in range(n)]
+                    return [coerced[i % len(coerced)] for i in range(n)]
+
+            return [_gen_value({"type": safe_type, "faker": "word"}) for _ in range(n)]
+
+        # Legacy fallback path.
         fn = _MAP.get(field.get("element_faker", "word"), _MAP["word"])
         return [fn() for _ in range(n)]
     if t == "Object":
