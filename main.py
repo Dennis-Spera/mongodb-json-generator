@@ -1,8 +1,16 @@
 import copy
+import html
 import json
+import os
 import random
 import socket
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from nicegui import ui, run
 from faker_fields import generate_documents
@@ -11,6 +19,8 @@ from schema_store import load_schemas, save_schema, delete_schema
 OUTPUT_DIR  = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 OUTPUT_FILENAME = "{collection}.json"  # supports {collection} placeholder
+ATLAS_URI = ""
+ATLAS_DB = ""
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -98,7 +108,7 @@ def _array_size_default(field: dict) -> int:
     return 1
 
 DEFAULT_FIELDS = [
-    {"id": 0, "name": "_id", "type": "ObjectId", "locked": True, "required": True, "cardinality": "1"},
+    {"id": 0, "name": "_id", "type": "ObjectId", "locked": True, "required": True},
 ]
 
 schemas = load_schemas()
@@ -111,7 +121,13 @@ if not schemas:
 collections: list[str] = list(schemas.keys())
 current_col: str = collections[0]
 
-gen_settings: dict = {"count": 1000, "seed": 42, "clear_first": True}
+gen_settings: dict = {
+    "count": 1000,
+    "seed": 42,
+    "clear_first": True,
+    "load_pymongo": False,
+    "load_mongoimport": True,
+}
 
 preview_docs: list[dict] = []
 preview_index: int = 0
@@ -210,16 +226,236 @@ def build_cli_html() -> str:
     )
 
 
-def _change_type(fid: int, new_type) -> None:
+def atlas_uri_status_label() -> str:
+    return "set" if ATLAS_URI.strip() else "not set"
+
+
+def _resolve_target_database() -> str:
+    explicit = ATLAS_DB.strip()
+    if explicit:
+        return explicit
+
+    uri = ATLAS_URI.strip()
+    if not uri:
+        return "test"
+
+    try:
+        parsed = urlparse(uri)
+        db_name = unquote(parsed.path.lstrip("/").split("/")[0])
+        return db_name or "test"
+    except Exception:
+        return "test"
+
+
+def build_connection_help_html() -> str:
+    col = current_col
+    fname = OUTPUT_FILENAME.replace("{collection}", col)
+    out_path = str((OUTPUT_DIR / fname).resolve()).replace("\\", "/")
+    db_name = html.escape(_resolve_target_database())
+
+    if not ATLAS_URI.strip():
+        return (
+            '<div style="margin-top:12px;font-size:11px;color:#9ca3af">'
+            "Set an Atlas connection string in Output settings to show mongoimport and pymongo examples."
+            "</div>"
+        )
+
+    safe_uri = html.escape(ATLAS_URI.strip())
+    return (
+        '<div style="margin-top:12px;font-size:11px;color:#666">'
+        '<div style="font-weight:600;color:#2a2a2a;margin-bottom:6px">Atlas import helpers</div>'
+        '<div style="font-family:\'Monaco\',\'Menlo\',monospace;background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;padding:10px;line-height:1.55">'
+        f"mongoimport --uri \"{safe_uri}\" --db {db_name} --collection {col} --file \"{html.escape(out_path)}\" --jsonArray"
+        "<br><br>"
+        "from pymongo import MongoClient"
+        "<br>"
+        f"client = MongoClient(\"{safe_uri}\")"
+        "<br>"
+        f"collection = client[\"{db_name}\"][\"{col}\"]"
+        "</div>"
+        "</div>"
+    )
+
+
+def build_connection_help_text() -> str:
+    col = current_col
+    fname = OUTPUT_FILENAME.replace("{collection}", col)
+    out_path = str((OUTPUT_DIR / fname).resolve())
+    db_name = _resolve_target_database()
+
+    if not ATLAS_URI.strip():
+        return ""
+
+    uri = ATLAS_URI.strip()
+    return (
+        "\n\n# Atlas import helpers\n"
+        f"mongoimport --uri \"{uri}\" --db {db_name} --collection {col} --file \"{out_path}\" --jsonArray\n\n"
+        "from pymongo import MongoClient\n"
+        f"client = MongoClient(\"{uri}\")\n"
+        f"collection = client[\"{db_name}\"][\"{col}\"]"
+    )
+
+
+def _normalize_type_value(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("value", "model-value", "modelValue"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate
+        if len(value) == 1:
+            only_value = next(iter(value.values()))
+            if isinstance(only_value, str):
+                return only_value
+        return None
+    if isinstance(value, (list, tuple)):
+        first = value[0] if value else None
+        return first if isinstance(first, str) else None
+    return None
+
+
+_HEX24_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+
+def _looks_like_iso_date(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    try:
+        datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def _guess_faker_for_name(name: str) -> str:
+    lowered = name.lower()
+    hints = [
+        ("email", "email"),
+        ("phone", "phone"),
+        ("mobile", "phone"),
+        ("name", "fullName"),
+        ("first", "firstName"),
+        ("last", "lastName"),
+        ("user", "username"),
+        ("company", "companyName"),
+        ("address", "street"),
+        ("street", "street"),
+        ("city", "city"),
+        ("state", "state"),
+        ("country", "country"),
+        ("zip", "zipCode"),
+        ("postal", "zipCode"),
+        ("url", "url"),
+        ("ip", "ipAddress"),
+        ("date", "date"),
+        ("created", "date"),
+        ("updated", "date"),
+    ]
+    for needle, faker in hints:
+        if needle in lowered:
+            return faker
+    return "word"
+
+
+def _infer_type_from_value(value) -> str:
+    if value is None:
+        return "Null"
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, int):
+        if -2147483648 <= value <= 2147483647:
+            return "Int32"
+        return "Int64"
+    if isinstance(value, float):
+        return "Double"
+    if isinstance(value, dict):
+        return "Object"
+    if isinstance(value, list):
+        return "Array"
+    if isinstance(value, str):
+        txt = value.strip()
+        if txt.startswith("ObjectId("):
+            return "ObjectId"
+        if _HEX24_RE.fullmatch(txt):
+            return "ObjectId"
+        if _UUID_RE.fullmatch(txt):
+            return "UUID"
+        if _looks_like_iso_date(txt):
+            return "Date"
+        return "String"
+    return "String"
+
+
+def _infer_field(name: str, value, *, locked: bool = False) -> dict:
+    field_type = _infer_type_from_value(value)
+    field = {
+        "id": _new_id(),
+        "name": name,
+        "type": field_type,
+        "required": True,
+    }
+    if locked:
+        field["locked"] = True
+
+    if field_type == "String":
+        field["faker"] = _guess_faker_for_name(name)
+    elif field_type == "Int32":
+        field.update({"min": 0, "max": 2147483647})
+    elif field_type == "Int64":
+        field.update({"min": 0, "max": 9007199254740991})
+    elif field_type == "Double":
+        field.update({"min": 0.0, "max": 1000.0})
+    elif field_type == "Array":
+        min_items = 0 if len(value) == 0 else 1
+        max_items = max(1, min(10, len(value) if len(value) > 0 else 3))
+        field.update({
+            "element_faker": "word",
+            "min_items": min_items,
+            "max_items": max_items,
+        })
+        if value:
+            first = value[0]
+            if isinstance(first, bool):
+                field["element_faker"] = "boolean"
+            elif isinstance(first, (int, float)):
+                field["element_faker"] = "number"
+            elif isinstance(first, str):
+                field["element_faker"] = _guess_faker_for_name(name)
+    elif field_type == "Object":
+        field["fields"] = _infer_fields_from_document(value)
+    elif field_type == "Range":
+        field.update({"min": 0, "max": 100})
+
+    return field
+
+
+def _infer_fields_from_document(doc: dict) -> list[dict]:
+    fields: list[dict] = []
+    for key, value in doc.items():
+        is_locked_id = key == "_id"
+        inferred = _infer_field(key, value, locked=is_locked_id)
+        fields.append(inferred)
+
+    if not any(f["name"] == "_id" for f in fields):
+        fields.insert(0, copy.deepcopy(DEFAULT_FIELDS[0]))
+    return fields
+
+
+def _change_type(fid: int, new_type) -> bool:
     field = find_field(fid)
     if not field or field.get("locked"):
-        return
+        return False
     new_type = _canonical_type(new_type)
     if not new_type or new_type == field["type"]:
-        return
-    # keep name/id/required/cardinality, reset type-specific keys
+        return False
+    # keep name/id/required, reset type-specific keys
     for k in ["faker", "min", "max", "values", "weights", "shuffler",
-              "element_faker", "element_type", "size", "seed_values", "seed_randomize", "min_items", "max_items", "fields"]:
+              "element_faker", "element_type", "size", "seed_values", "seed_randomize", "min_items", "max_items", "fields", "cardinality"]:
         field.pop(k, None)
     field["type"] = new_type
     if new_type == "String":
@@ -239,6 +475,7 @@ def _change_type(fid: int, new_type) -> None:
     elif new_type == "Object":
         field["fields"] = []
     save_schema(current_col, schemas[current_col])
+    return True
 
 
 def update_field_prop(fid: int, key: str, value) -> None:
@@ -380,6 +617,14 @@ body,.q-page,.q-page-container{background:#f5f1ed!important;font-family:-apple-s
 .pool-weight{width:38px;border:.5px solid #fbcfe8;border-radius:8px;font-size:10px;text-align:center;color:#be185d;font-family:'Monaco','Menlo',monospace;padding:2px 0;background:#fff}
 .pool-meta{display:flex;gap:12px;font-size:11px;color:#be185d;align-items:center;flex-wrap:wrap}
 .pool-csv-btn{background:#fff;border:.5px solid #fbcfe8;color:#be185d;padding:4px 10px;border-radius:12px;font-size:11px;cursor:pointer}
+.output-link{color:#1e40af;cursor:pointer;text-decoration:underline;font-size:11px}
+.output-link:hover{color:#1d4ed8}
+.output-detail{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;padding:8px 0 10px}
+.output-viewer{background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;max-height:52vh;overflow:auto}
+.ov-line{display:grid;grid-template-columns:56px 1fr;gap:10px;padding:2px 10px;cursor:pointer}
+.ov-line:hover{background:#eef2ff}
+.ov-ln{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#9ca3af;text-align:right;user-select:none}
+.ov-code{font-family:'Monaco','Menlo',monospace;font-size:12px;color:#2a2a2a;white-space:pre}
 .gen-options{display:flex;align-items:center;gap:16px;padding:10px 20px;border-top:.5px solid #e0dcd8;font-size:12px;color:#666;flex-wrap:wrap;flex-shrink:0}
 .gen-option{display:flex;align-items:center;gap:6px}
 .checkbox-fake{width:14px;height:14px;border:.5px solid #d0ccc8;border-radius:3px;display:inline-block;position:relative;cursor:pointer;flex-shrink:0}
@@ -421,10 +666,10 @@ body,.q-page,.q-page-container{background:#f5f1ed!important;font-family:-apple-s
 .modal-copy{display:flex;align-items:center;gap:6px;padding:7px 14px;background:#2a2a2a;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer}
 .modal-copy:hover{background:#1a1a1a}
 .status-ok{color:#10b981;font-size:12px;font-weight:500}
-.schema-header,.schema-row{display:grid;grid-template-columns:20px 1fr 120px 60px 110px 80px 24px;gap:6px;align-items:center;padding:8px 0}
+.schema-header,.schema-row{display:grid;grid-template-columns:20px 1fr 140px 110px 80px 24px;gap:6px;align-items:center;padding:8px 0}
 .schema-header{font-size:11px;text-transform:uppercase;color:#666;font-weight:600;letter-spacing:.3px;border-bottom:.5px solid #e0dcd8}
 .schema-row{border-bottom:.5px solid #f0ebe8;cursor:pointer}
-.schema-row.nested-row{grid-template-columns:20px 1fr 120px 60px 110px 80px 24px;padding-left:32px;border-left:2px solid #d8c5e8;font-size:12px}
+.schema-row.nested-row{grid-template-columns:20px 1fr 140px 110px 80px 24px;padding-left:32px;border-left:2px solid #d8c5e8;font-size:12px}
 .shuffler-inline{display:flex;align-items:center;gap:4px}
 .shuffler-inline input[type=range]{width:68px;accent-color:#6b5b95;height:3px;cursor:pointer}
 .shuffler-inline .shuf-val{font-size:10px;font-family:'Monaco','Menlo',monospace;color:#6b5b95;min-width:18px}
@@ -440,9 +685,9 @@ body,.q-page,.q-page-container{background:#f5f1ed!important;font-family:-apple-s
 .detail-select{padding:4px 8px;border:.5px solid #e0dcd8;border-radius:4px;font-size:11px;background:#fff;color:#4a4a4a}
 .detail-shuffler{width:140px;accent-color:#6b5b95;height:4px}
 .detail-shuffler-val{font-size:11px;font-family:'Monaco','Menlo',monospace;color:#6b5b95;min-width:28px}
-.cell-name .q-field,.cell-card .q-field{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important}
-.cell-name .q-field__native,.cell-card .q-field__native{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important;color:#2a2a2a!important;padding:0!important}
-.cell-name .q-field--borderless .q-field__control,.cell-card .q-field--borderless .q-field__control{padding:0!important;min-height:24px!important}
+.cell-name .q-field{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important}
+.cell-name .q-field__native{font-family:'Monaco','Menlo',monospace!important;font-size:12px!important;color:#2a2a2a!important;padding:0!important}
+.cell-name .q-field--borderless .q-field__control{padding:0!important;min-height:24px!important}
 .cell-type{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666}
 .cell-req{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#999;cursor:pointer;user-select:none}
 .cell-req .dot{width:8px;height:8px;border-radius:50%;background:#ddd;display:inline-block;flex-shrink:0}
@@ -481,6 +726,12 @@ def index():
     ui.add_head_html(APP_CSS)
 
     saved_label_ref: list = []   # [label_element]
+    output_dialog_ref: list = []
+    output_path_ref: list = []
+    output_detail_ref: list = []
+    output_lines_ref: list = []
+    output_page_ref: list = []
+    output_meta = {"line_count": 1, "documents": 0, "lines": [], "page": 0, "page_size": 400}
 
     # ── Refreshable sections ──────────────────────────────────────────────────
 
@@ -508,8 +759,11 @@ def index():
                     <div class="column-subtitle">collection: {current_col}</div>
                 </div>
             ''')
-            ui.html('<button class="btn-action">+ Field</button>') \
-                .on("click", lambda: add_field_of_type("String"))
+            with ui.row().style("gap:8px"):
+                ui.html('<button class="btn-action">Import JSON</button>') \
+                    .on("click", open_import_json_dialog)
+                ui.html('<button class="btn-action">+ Field</button>') \
+                    .on("click", lambda: add_field_of_type("String"))
 
     @ui.refreshable
     def render_schema_table():
@@ -545,25 +799,32 @@ def index():
                         ui.html(type_label(field))
                     else:
                         canonical = _TYPE_LOOKUP.get(field["type"].lower(), field["type"])
-                        ui.select(TYPE_OPTIONS, value=canonical) \
-                          .props("dense borderless options-dense") \
-                          .style("font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;min-width:110px") \
-                          .on("update:model-value", lambda e, f=field: [_change_type(f["id"], e.sender.value), render_schema_table.refresh()])
-                        if field["type"] == "Array":
-                            ui.html('<span class="chip" style="margin-left:6px;cursor:pointer">⚙ Array</span>') \
-                              .on("click", lambda f=field: open_array_settings_dialog(f["id"]))
 
-                # cardinality — editable unless array (auto from min/max)
-                with ui.element("div").classes("cell-card"):
-                    if field["type"] == "Array":
-                        ui.html(f'<span style="font-size:11px;color:#888">{cardinality_of(field)}</span>')
-                    elif locked:
-                        ui.html('<span style="font-size:11px;color:#888">1</span>')
-                    else:
-                        cinp = ui.input(value=cardinality_of(field)).props("dense borderless") \
-                                  .style("font-family:'Monaco','Menlo',monospace;font-size:11px;width:60px")
-                        cinp.on("blur",
-                                lambda e, f=field: update_field_prop(f["id"], "cardinality", e.sender.value))
+                        def _on_type_change(e, f=field):
+                            raw_value = getattr(e, "value", None)
+                            if raw_value is None and hasattr(e, "sender"):
+                                raw_value = getattr(e.sender, "value", None)
+                            if raw_value is None:
+                                raw_value = e.args
+                            chosen_type = _normalize_type_value(raw_value)
+                            chosen_type = _TYPE_LOOKUP.get(chosen_type.lower(), chosen_type) if isinstance(chosen_type, str) else None
+                            changed = _change_type(f["id"], chosen_type)
+                            render_schema_table.refresh()
+                            if changed and chosen_type == "Range":
+                                open_range_dialog(f["id"])
+
+                        with ui.row().style("gap:4px;align-items:center;flex-wrap:nowrap"):
+                            ui.select(TYPE_OPTIONS, value=canonical) \
+                              .props("dense borderless options-dense") \
+                              .style("font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;min-width:110px") \
+                              .on("update:model-value", _on_type_change)
+                            if field["type"] == "Range":
+                                ui.button("Set", on_click=lambda f=field: open_range_dialog(f["id"])) \
+                                  .props("flat dense no-caps") \
+                                  .style("font-size:10px;color:#4b5563;min-width:34px;height:24px;padding:0 6px")
+                                                        if field["type"] == "Array":
+                                                                ui.html('<span class="chip" style="margin-left:6px;cursor:pointer">⚙ Array</span>') \
+                                                                    .on("click", lambda f=field: open_array_settings_dialog(f["id"]))
 
                 # shuffler slider (inline)
                 sh = field.get("shuffler", 1)
@@ -599,7 +860,6 @@ def index():
             <span></span>
             <span>Field name</span>
             <span>Type</span>
-            <span>Card.</span>
             <span>Shuffler</span>
             <span>Required</span>
             <span></span>
@@ -630,9 +890,12 @@ def index():
     @ui.refreshable
     def render_gen_options():
         clear_cls = "checked" if gen_settings["clear_first"] else ""
+        pymongo_cls = "checked" if gen_settings["load_pymongo"] else ""
+        mongoimport_cls = "checked" if gen_settings["load_mongoimport"] else ""
         seed_val  = gen_settings["seed"]
         fname     = OUTPUT_FILENAME.replace("{collection}", current_col)
         out_path  = str(OUTPUT_DIR / fname).replace("\\", "/")
+        atlas_status = atlas_uri_status_label()
 
         opt_html = f'''
         <div class="gen-option">
@@ -645,11 +908,23 @@ def index():
         </div>
         <div class="gen-option" style="color:#aaa;font-family:'Monaco','Menlo',monospace;font-size:11px">
             → {out_path}
+        </div>
+        <div class="gen-option" style="font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666">
+            Atlas URI: {atlas_status} (open Output settings)
+        </div>
+        <div class="gen-option">
+            <span class="checkbox-fake {mongoimport_cls}" id="load-mongoimport-chk"></span>
+            <span>Load via mongoimport</span>
+        </div>
+        <div class="gen-option">
+            <span class="checkbox-fake {pymongo_cls}" id="load-pymongo-chk"></span>
+            <span>Load via pymongo</span>
         </div>'''
 
         opt_el = ui.html(opt_html)
         opt_el.on("click",  handle_gen_option_click)
         opt_el.on("change", handle_seed_change)
+        ui.html('<span class="output-link">View output</span>').on("click", lambda: open_output_viewer_page())
 
     @ui.refreshable
     def render_action_bar():
@@ -764,12 +1039,12 @@ def index():
         dlg.open()
 
     def open_settings_dialog():
-        global OUTPUT_DIR, OUTPUT_FILENAME
+        global OUTPUT_DIR, OUTPUT_FILENAME, ATLAS_URI, ATLAS_DB
         with ui.dialog().props("persistent") as dlg:
             with ui.element("div").style(
                 "width:480px;max-width:90vw;background:#fff;border-radius:10px;"
                 "border:.5px solid #e0dcd8;box-shadow:0 12px 32px rgba(0,0,0,.18);"
-                "display:flex;flex-direction:column;overflow:hidden"
+                "display:flex;flex-direction:column;overflow:hidden;max-height:85vh"
             ):
                 with ui.element("div").style(
                     "display:flex;justify-content:space-between;align-items:center;"
@@ -779,26 +1054,24 @@ def index():
                     ui.button("✕", on_click=dlg.close).props("flat dense round") \
                         .style("color:#666;font-size:13px;min-width:28px;height:28px")
 
-                with ui.element("div").style("padding:18px;display:flex;flex-direction:column;gap:14px"):
+                with ui.element("div").style("padding:18px;display:flex;flex-direction:column;gap:14px;overflow:auto"):
                     ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600">Output directory</div>')
                     with ui.element("div").style("display:flex;gap:8px;align-items:center"):
                         dir_inp = ui.input(value=str(OUTPUT_DIR)).props("outlined dense") \
                             .style("flex:1;font-family:'Monaco','Menlo',monospace;font-size:12px")
 
-                        async def browse_dir():
-                            def _pick():
-                                import tkinter as tk
-                                from tkinter import filedialog
-                                root = tk.Tk()
-                                root.withdraw()
-                                root.wm_attributes("-topmost", 1)
-                                chosen = filedialog.askdirectory(
-                                    title="Select output directory",
-                                    initialdir=dir_inp.value or str(OUTPUT_DIR),
-                                )
-                                root.destroy()
-                                return chosen
-                            chosen = await run.io_bound(_pick)
+                        def browse_dir():
+                            import tkinter as tk
+                            from tkinter import filedialog
+
+                            root = tk.Tk()
+                            root.withdraw()
+                            root.wm_attributes("-topmost", 1)
+                            chosen = filedialog.askdirectory(
+                                title="Select output directory",
+                                initialdir=dir_inp.value or str(OUTPUT_DIR),
+                            )
+                            root.destroy()
                             if chosen:
                                 dir_inp.set_value(chosen)
 
@@ -811,27 +1084,179 @@ def index():
                     name_inp = ui.input(value=OUTPUT_FILENAME).props("outlined dense") \
                         .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
 
+                    ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600;margin-top:4px">Atlas connection string (optional)</div>')
+                    ui.html('<div style="font-size:11px;color:#aaa;margin-bottom:4px">Used for generated mongoimport and pymongo helper commands in the CLI modal.</div>')
+                    atlas_inp = ui.input(
+                        value=ATLAS_URI,
+                        placeholder="mongodb+srv://user:pass@cluster.example.mongodb.net/?retryWrites=true&w=majority",
+                    ).props("outlined dense") \
+                        .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
+
+                    ui.html('<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.3px;font-weight:600;margin-top:4px">Atlas database name (optional)</div>')
+                    ui.html('<div style="font-size:11px;color:#aaa;margin-bottom:4px">Used by Data Load. If empty, the database in your URI is used, otherwise test.</div>')
+                    atlas_db_inp = ui.input(value=ATLAS_DB, placeholder="sample_mflix") \
+                        .props("outlined dense") \
+                        .style("width:100%;font-family:'Monaco','Menlo',monospace;font-size:12px")
+
                 with ui.element("div").style(
                     "display:flex;justify-content:flex-end;gap:8px;padding:12px 18px 18px"
                 ):
                     ui.button("Cancel", on_click=dlg.close).props("flat no-caps") \
                         .style("color:#666;font-size:12px")
                     def save_settings():
-                        global OUTPUT_DIR, OUTPUT_FILENAME
+                        global OUTPUT_DIR, OUTPUT_FILENAME, ATLAS_URI, ATLAS_DB
                         new_dir = Path(dir_inp.value.strip()) if dir_inp.value.strip() else OUTPUT_DIR
                         new_dir.mkdir(parents=True, exist_ok=True)
                         OUTPUT_DIR = new_dir
                         OUTPUT_FILENAME = name_inp.value.strip() or "{collection}.json"
+                        ATLAS_URI = (atlas_inp.value or "").strip()
+                        ATLAS_DB = (atlas_db_inp.value or "").strip()
                         render_gen_options.refresh()
                         dlg.close()
                     ui.button("Save", on_click=save_settings).props("no-caps unelevated") \
                         .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px;padding:7px 18px;box-shadow:none")
         dlg.open()
 
+    def open_import_json_dialog():
+        selected_path = {"value": ""}
+        pending_upload = {"payload": None, "name": ""}
+
+        def import_payload(payload, source_name: str):
+            doc = None
+            if isinstance(payload, dict):
+                doc = payload
+            elif isinstance(payload, list):
+                doc = next((x for x in payload if isinstance(x, dict)), None)
+
+            if doc is None:
+                ui.notify("JSON must be an object or an array containing at least one object", color="warning")
+                return
+
+            schemas[current_col] = _infer_fields_from_document(doc)
+            _auto_save()
+
+            preview_docs.clear()
+            preview_docs.append(doc)
+            render_schema_table.refresh()
+            render_preview.refresh()
+
+            ui.notify(f"Imported schema from {source_name}", color="positive")
+
+        with ui.dialog().props("persistent") as dlg:
+            with ui.element("div").style(
+                "width:560px;max-width:92vw;background:#fff;border-radius:10px;"
+                "border:.5px solid #e0dcd8;box-shadow:0 12px 32px rgba(0,0,0,.18);"
+                "display:flex;flex-direction:column;overflow:hidden"
+            ):
+                with ui.element("div").style(
+                    "display:flex;justify-content:space-between;align-items:center;"
+                    "padding:14px 18px;border-bottom:.5px solid #e0dcd8"
+                ):
+                    ui.html('<div class="modal-title">Import schema from JSON</div>')
+                    ui.button("✕", on_click=dlg.close).props("flat dense round") \
+                        .style("color:#666;font-size:13px;min-width:28px;height:28px")
+
+                with ui.element("div").style("padding:18px;display:flex;flex-direction:column;gap:12px"):
+                    ui.html('<div style="font-size:12px;color:#777">Upload a JSON file (or provide a local path). The first object will be used to infer field types.</div>')
+
+                    def _read_upload_text(e) -> str:
+                        content = getattr(e, "content", None)
+                        if content is None:
+                            raise ValueError("Uploaded file content is empty")
+                        if isinstance(content, (bytes, bytearray)):
+                            return bytes(content).decode("utf-8")
+                        if hasattr(content, "read"):
+                            if hasattr(content, "seek"):
+                                try:
+                                    content.seek(0)
+                                except Exception:
+                                    pass
+                            raw = content.read()
+                            if (raw is None or raw == b"" or raw == "") and hasattr(content, "getvalue"):
+                                try:
+                                    raw = content.getvalue()
+                                except Exception:
+                                    raw = raw
+                            if isinstance(raw, bytes):
+                                if not raw and hasattr(content, "name") and content.name:
+                                    try:
+                                        raw = Path(content.name).read_bytes()
+                                    except Exception:
+                                        pass
+                                return raw.decode("utf-8")
+                            if (raw is None or raw == "") and hasattr(content, "name") and content.name:
+                                try:
+                                    return Path(content.name).read_text(encoding="utf-8")
+                                except Exception:
+                                    pass
+                            return str(raw)
+                        return str(content)
+
+                    async def handle_upload(e):
+                        try:
+                            uploaded_file = getattr(e, "file", None)
+                            if uploaded_file is not None:
+                                payload = await uploaded_file.json()
+                                source_name = uploaded_file.name or "uploaded file"
+                            else:
+                                payload = json.loads(_read_upload_text(e))
+                                source_name = getattr(e, "name", "uploaded file")
+                        except Exception as exc:
+                            ui.notify(f"Failed to parse JSON: {exc}", color="negative")
+                            return
+                        pending_upload["payload"] = payload
+                        pending_upload["name"] = source_name
+                        ui.notify(f"Loaded {source_name}. Click Import to apply.", color="info")
+
+                    ui.upload(on_upload=handle_upload, auto_upload=True, max_files=1) \
+                        .props("accept=.json") \
+                        .style("border:.5px dashed #d0ccc8;border-radius:8px;padding:8px")
+
+                    ui.html('<div style="font-size:11px;color:#aaa">or import by local file path</div>')
+                    with ui.element("div").style("display:flex;gap:8px;align-items:center"):
+                        file_inp = ui.input(placeholder="/path/to/file.json").props("outlined dense") \
+                            .style("flex:1;font-family:'Monaco','Menlo',monospace;font-size:12px")
+                        file_inp.on("change", lambda e: selected_path.update({"value": e.sender.value or ""}))
+
+                with ui.element("div").style("display:flex;justify-content:flex-end;gap:8px;padding:12px 18px 18px"):
+                    ui.button("Cancel", on_click=dlg.close).props("flat no-caps") \
+                        .style("color:#666;font-size:12px")
+
+                    def do_import():
+                        if pending_upload.get("payload") is not None:
+                            import_payload(pending_upload["payload"], pending_upload.get("name") or "uploaded file")
+                            dlg.close()
+                            return
+
+                        path_text = (selected_path.get("value") or file_inp.value or "").strip().strip('"').strip("'")
+                        if not path_text:
+                            ui.notify("Upload a JSON file or provide a file path first", color="warning")
+                            return
+                        path = Path(path_text).expanduser()
+                        if not path.is_absolute():
+                            path = (Path(__file__).parent / path).resolve()
+                        if not path.exists() or not path.is_file():
+                            ui.notify(f"File not found: {path}", color="negative")
+                            return
+                        try:
+                            payload = json.loads(path.read_text(encoding="utf-8"))
+                        except Exception as exc:
+                            ui.notify(f"Failed to parse JSON: {exc}", color="negative")
+                            return
+
+                        import_payload(payload, path.name)
+                        dlg.close()
+
+                    ui.button("Import", on_click=do_import).props("no-caps unelevated") \
+                        .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px;padding:7px 18px;box-shadow:none")
+
+        dlg.open()
+
     # ── CLI modal ─────────────────────────────────────────────────────────────
 
     def open_cli_modal():
         cmd_html = build_cli_html()
+        connection_html = build_connection_help_html()
         plain_cmd = (
             f"mongodocgen generate \\\n"
             f"  --collection {current_col} \\\n"
@@ -841,6 +1266,7 @@ def index():
             f"  --output output/{current_col}.json"
             + ("\\\n  --overwrite" if gen_settings["clear_first"] else "")
         )
+        plain_cmd += build_connection_help_text()
 
         with ui.dialog().props("persistent") as dlg:
             with ui.element("div").style(
@@ -864,13 +1290,14 @@ def index():
                         .style("color:#666;font-size:13px;min-width:28px;height:28px")
                 # code block
                 ui.html(f'<div style="padding:18px 18px 0"><div class="modal-code">{cmd_html}</div></div>')
+                ui.html(f'<div style="padding:0 18px 0">{connection_html}</div>')
                 # footer
                 with ui.element("div").style(
                     "display:flex;justify-content:space-between;align-items:center;"
                     "padding:12px 18px 18px"
                 ):
                     ui.html('<span style="font-size:11px;color:#999">Updates automatically as you change settings</span>')
-                    ui.button("📋 Copy command", on_click=lambda: ui.run_javascript(
+                    ui.button("📋 Copy commands", on_click=lambda: ui.run_javascript(
                         f"navigator.clipboard.writeText({json.dumps(plain_cmd)}).catch(()=>{{}})", timeout=5
                     )).props("no-caps unelevated") \
                       .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px;"
@@ -933,6 +1360,14 @@ def index():
         if el_id == "clear-chk":
             gen_settings["clear_first"] = not gen_settings["clear_first"]
             render_gen_options.refresh()
+        elif el_id == "load-mongoimport-chk":
+            gen_settings["load_mongoimport"] = not gen_settings["load_mongoimport"]
+            render_gen_options.refresh()
+        elif el_id == "load-pymongo-chk":
+            gen_settings["load_pymongo"] = not gen_settings["load_pymongo"]
+            render_gen_options.refresh()
+        elif el_id == "view-output-link":
+            open_output_viewer_dialog()
 
     def handle_seed_change(e):
         args = e.args or {}
@@ -1024,6 +1459,89 @@ def index():
         t = threading.Thread(target=lambda: ctx.run(run_chunks), daemon=True)
         t.start()
 
+    def do_data_load():
+        uri = ATLAS_URI.strip()
+        if not uri:
+            ui.notify("Set Atlas connection string in Output settings before Data Load", color="warning")
+            return
+
+        if not (gen_settings["load_mongoimport"] or gen_settings["load_pymongo"]):
+            ui.notify("Select at least one load method: mongoimport or pymongo", color="warning")
+            return
+
+        if gen_settings["load_mongoimport"] and shutil.which("mongoimport") is None:
+            ui.notify("mongoimport binary not found in PATH", color="negative")
+            return
+
+        fname = OUTPUT_FILENAME.replace("{collection}", current_col)
+        out_path = OUTPUT_DIR / fname
+        if not out_path.exists() or not out_path.is_file():
+            ui.notify(f"Output file not found: {out_path}", color="warning")
+            return
+
+        db_name = _resolve_target_database()
+        loaded_via: list[str] = []
+
+        if gen_settings["load_mongoimport"]:
+            cmd = [
+                "mongoimport",
+                "--uri",
+                uri,
+                "--db",
+                db_name,
+                "--collection",
+                current_col,
+                "--file",
+                str(out_path),
+                "--jsonArray",
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except FileNotFoundError:
+                ui.notify("mongoimport not found in PATH", color="negative")
+                return
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "mongoimport failed").strip()
+                ui.notify(f"mongoimport failed: {err[:180]}", color="negative")
+                return
+            loaded_via.append("mongoimport")
+
+        if gen_settings["load_pymongo"]:
+            try:
+                from pymongo import MongoClient
+            except Exception:
+                ui.notify("pymongo is not installed. Run: uv add pymongo", color="negative")
+                return
+
+            try:
+                payload = json.loads(out_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                ui.notify(f"Could not parse output JSON: {exc}", color="negative")
+                return
+
+            docs = payload if isinstance(payload, list) else [payload]
+            docs = [d for d in docs if isinstance(d, dict)]
+            if not docs:
+                ui.notify("No JSON documents found to insert", color="warning")
+                return
+
+            try:
+                client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+                collection = client[db_name][current_col]
+                if len(docs) == 1:
+                    collection.insert_one(docs[0])
+                else:
+                    collection.insert_many(docs, ordered=False)
+            except Exception as exc:
+                ui.notify(f"pymongo load failed: {exc}", color="negative")
+                return
+            loaded_via.append("pymongo")
+
+        ui.notify(
+            f"Data Load complete via {', '.join(loaded_via)} -> {db_name}.{current_col}",
+            color="positive",
+        )
+
     def prev_sample():
         global preview_index
         if preview_docs and preview_index > 0:
@@ -1041,7 +1559,7 @@ def index():
         names = {"String": "new_field", "Range": "age", "Enum": "status",
                  "Array": "tags", "Object": "nested"}
         field: dict = {"id": _new_id(), "name": names.get(ftype, "field"),
-                       "type": ftype, "required": False, "cardinality": "1"}
+                       "type": ftype, "required": False}
         if ftype == "String":
             field["faker"] = "word"
         elif ftype == "Range":
@@ -1063,7 +1581,7 @@ def index():
         if parent and parent["type"] == "Object":
             parent.setdefault("fields", []).append(
                 {"id": _new_id(), "name": "nested_field", "type": "String",
-                 "faker": "word", "required": False, "cardinality": "1"}
+                 "faker": "word", "required": False}
             )
             _auto_save()
             render_schema_table.refresh()
@@ -1077,6 +1595,164 @@ def index():
                 extra["name"] = name
                 add_field_of_type(ftype, extra)
                 break
+
+    def _parse_numeric_text(value: str, fallback):
+        text = (value or "").strip()
+        if not text:
+            return fallback
+        try:
+            return float(text) if "." in text else int(text)
+        except ValueError:
+            return fallback
+
+    def open_range_dialog(fid: int):
+        field = find_field(fid)
+        if not field or field.get("type") != "Range":
+            return
+
+        current_min = field.get("min", 0)
+        current_max = field.get("max", 100)
+
+        with ui.dialog().props("persistent") as dlg:
+            with ui.element("div").style(
+                "width:420px;max-width:92vw;background:#fff;border-radius:10px;"
+                "border:.5px solid #e0dcd8;box-shadow:0 12px 32px rgba(0,0,0,.18);"
+                "display:flex;flex-direction:column;overflow:hidden"
+            ):
+                with ui.element("div").style(
+                    "display:flex;justify-content:space-between;align-items:center;"
+                    "padding:14px 18px;border-bottom:.5px solid #e0dcd8"
+                ):
+                    ui.html('<div class="modal-title">Configure range</div>')
+                    ui.button("✕", on_click=dlg.close).props("flat dense round") \
+                        .style("color:#666;font-size:13px;min-width:28px;height:28px")
+
+                with ui.element("div").style("padding:16px 18px;display:flex;flex-direction:column;gap:12px"):
+                    ui.html('<div style="font-size:12px;color:#888">Set minimum and maximum values for this field.</div>')
+                    with ui.row().style("gap:10px"):
+                        min_inp = ui.input(value=str(current_min), label="Min") \
+                            .props("outlined dense type=number") \
+                            .style("flex:1;font-family:'Monaco','Menlo',monospace")
+                        max_inp = ui.input(value=str(current_max), label="Max") \
+                            .props("outlined dense type=number") \
+                            .style("flex:1;font-family:'Monaco','Menlo',monospace")
+
+                with ui.element("div").style("display:flex;justify-content:flex-end;gap:8px;padding:12px 18px 18px"):
+                    ui.button("Cancel", on_click=dlg.close).props("flat no-caps") \
+                        .style("color:#666;font-size:12px")
+
+                    def save_range():
+                        min_val = _parse_numeric_text(min_inp.value, current_min)
+                        max_val = _parse_numeric_text(max_inp.value, current_max)
+                        if min_val > max_val:
+                            min_val, max_val = max_val, min_val
+                        target = find_field(fid)
+                        if not target:
+                            dlg.close()
+                            return
+                        target["min"] = min_val
+                        target["max"] = max_val
+                        _auto_save()
+                        render_schema_table.refresh()
+                        dlg.close()
+
+                    ui.button("Save", on_click=save_range).props("no-caps unelevated") \
+                        .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px;padding:7px 18px;box-shadow:none")
+
+        dlg.open()
+
+    def _set_output_detail_line(line_no: int) -> None:
+        if not output_detail_ref:
+            return
+        output_detail_ref[0].set_content(
+            f'<div class="output-detail" id="output-detail-live">Line {line_no} of {output_meta["line_count"]} · Documents: {output_meta["documents"]}</div>'
+        )
+
+    def _render_output_page() -> None:
+        if not output_lines_ref:
+            return
+        lines: list[str] = output_meta.get("lines", [])
+        if not lines:
+            output_lines_ref[0].set_content('<div id="output-lines-body"></div>')
+            _set_output_detail_line(1)
+            return
+
+        page_size = output_meta["page_size"]
+        page = output_meta["page"]
+        total_pages = max(1, (len(lines) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        output_meta["page"] = page
+
+        start = page * page_size
+        end = min(len(lines), start + page_size)
+        page_lines = lines[start:end]
+
+        lines_html = "".join(
+            f'<div class="ov-line" data-line="{idx}"><span class="ov-ln">{idx}</span><span class="ov-code">{html.escape(line if line else " ")}</span></div>'
+            for idx, line in enumerate(page_lines, start=start + 1)
+        )
+        output_lines_ref[0].set_content(f'<div id="output-lines-body">{lines_html}</div>')
+
+        if output_page_ref:
+            output_page_ref[0].set_content(
+                f'<span style="font-size:11px;color:#666">Page {page + 1} / {total_pages} · Lines {start + 1}-{end}</span>'
+            )
+
+        _set_output_detail_line(start + 1)
+        ui.run_javascript(
+            (
+                "(function(){"
+                "const body=document.getElementById('output-lines-body');"
+                "const detail=document.getElementById('output-detail-live');"
+                f"const total={output_meta['line_count']};"
+                f"const docs={output_meta['documents']};"
+                "if(!body||!detail)return;"
+                "body.onclick=(ev)=>{const row=ev.target.closest('.ov-line');"
+                "if(!row)return;const ln=row.getAttribute('data-line')||'1';"
+                "detail.textContent=`Line ${ln} of ${total} · Documents: ${docs}`;};"
+                "})();"
+            ),
+            timeout=5,
+        )
+
+    def open_output_viewer_dialog():
+        fname = OUTPUT_FILENAME.replace("{collection}", current_col)
+        out_path = OUTPUT_DIR / fname
+        if not out_path.exists() or not out_path.is_file():
+            ui.notify(f"Output file not found: {out_path}", color="warning")
+            return
+
+        try:
+            raw_text = out_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            ui.notify(f"Unable to read output: {exc}", color="negative")
+            return
+
+        lines = raw_text.splitlines() or [""]
+        output_meta["lines"] = lines
+        output_meta["line_count"] = len(lines)
+        output_meta["page"] = 0
+        try:
+            parsed = json.loads(raw_text)
+            output_meta["documents"] = len(parsed) if isinstance(parsed, list) else (1 if isinstance(parsed, dict) else 0)
+        except Exception:
+            output_meta["documents"] = 0
+
+        output_path_ref[0].set_content(html.escape(str(out_path)))
+        _render_output_page()
+        output_dialog_ref[0].open()
+
+    def restart_app():
+        ui.notify("Restarting app...", color="warning")
+
+        def _do_restart():
+            script_path = str(Path(__file__).resolve())
+            os.execv(sys.executable, [sys.executable, script_path, *sys.argv[1:]])
+
+        ui.timer(0.2, _do_restart, once=True)
+
+    def open_output_viewer_page():
+        ui.navigate.to(f"/output-viewer?collection={current_col}")
 
     def _auto_save():
         save_schema(current_col, schemas[current_col])
@@ -1114,6 +1790,12 @@ def index():
                 ''')
                 with ui.element("div").style("display:flex;gap:8px;margin-left:auto"):
                     ui.button("</> CLI", on_click=open_cli_modal) \
+                        .props("no-caps unelevated") \
+                        .style("background:#f9f7f5;color:#4a4a4a;border:1px solid #e0dcd8;border-radius:6px;font-size:12px;font-family:'Monaco','Menlo',monospace;padding:8px 14px;box-shadow:none")
+                    ui.button("⇪ Data Load", on_click=do_data_load) \
+                        .props("no-caps unelevated") \
+                        .style("background:#f9f7f5;color:#4a4a4a;border:1px solid #e0dcd8;border-radius:6px;font-size:12px;font-family:'Monaco','Menlo',monospace;padding:8px 14px;box-shadow:none")
+                    ui.button("↻ Restart", on_click=restart_app) \
                         .props("no-caps unelevated") \
                         .style("background:#f9f7f5;color:#4a4a4a;border:1px solid #e0dcd8;border-radius:6px;font-size:12px;font-family:'Monaco','Menlo',monospace;padding:8px 14px;box-shadow:none")
                     ui.button("▶ Generate", on_click=do_generate) \
@@ -1172,6 +1854,197 @@ def index():
             with ui.element("div").classes("action-bar"):
                 render_action_bar()
 
+            with ui.dialog().props("persistent") as output_dlg:
+                output_dialog_ref.append(output_dlg)
+                with ui.element("div").style(
+                    "width:940px;max-width:96vw;background:#fff;border-radius:10px;"
+                    "border:.5px solid #e0dcd8;box-shadow:0 12px 32px rgba(0,0,0,.18);"
+                    "display:flex;flex-direction:column;overflow:hidden"
+                ):
+                    with ui.element("div").style(
+                        "display:flex;justify-content:space-between;align-items:center;"
+                        "padding:14px 18px;border-bottom:.5px solid #e0dcd8"
+                    ):
+                        with ui.element("div"):
+                            ui.html('<div class="modal-title">Output viewer</div>')
+                            output_path_ref.append(ui.html('<div class="modal-subtitle"></div>'))
+                        ui.button("✕", on_click=output_dlg.close).props("flat dense round") \
+                            .style("color:#666;font-size:13px;min-width:28px;height:28px")
+
+                    with ui.element("div").style("padding:12px 18px 18px"):
+                        output_detail_ref.append(ui.html('<div class="output-detail" id="output-detail-live">Line 1 of 1 · Documents: 0</div>'))
+                        with ui.row().style("justify-content:space-between;align-items:center;margin-bottom:8px"):
+                            with ui.row().style("gap:6px"):
+                                ui.button("◀ Prev", on_click=lambda: [output_meta.update({"page": max(0, output_meta["page"] - 1)}), _render_output_page()]) \
+                                    .props("flat dense no-caps") \
+                                    .style("font-size:11px")
+                                ui.button("Next ▶", on_click=lambda: [output_meta.update({"page": output_meta["page"] + 1}), _render_output_page()]) \
+                                    .props("flat dense no-caps") \
+                                    .style("font-size:11px")
+                            output_page_ref.append(ui.html('<span style="font-size:11px;color:#666">Page 1 / 1</span>'))
+                        output_lines_ref.append(ui.html('<div id="output-lines-body"></div>').classes("output-viewer"))
+
+
+
+@ui.page("/output-viewer")
+def output_viewer_page(collection: str = ""):
+    selected_collection = collection or current_col
+    fname = OUTPUT_FILENAME.replace("{collection}", selected_collection)
+    out_path = OUTPUT_DIR / fname
+
+    ui.add_head_html("""
+    <style>
+    .ov-page{padding:16px;max-width:1200px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+    .ov-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+    .ov-title{font-size:18px;font-weight:600;color:#2a2a2a}
+    .ov-sub{font-size:12px;color:#888;font-family:'Monaco','Menlo',monospace}
+    .ov-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+    .ov-box{background:#f9f7f5;border:.5px solid #e0dcd8;border-radius:6px;max-height:68vh;overflow:auto}
+    .ov-line{display:grid;grid-template-columns:56px 1fr;gap:10px;padding:2px 10px;cursor:pointer}
+    .ov-line:hover{background:#eef2ff}
+    .ov-ln{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#9ca3af;text-align:right;user-select:none}
+    .ov-code{font-family:'Monaco','Menlo',monospace;font-size:12px;color:#2a2a2a;white-space:pre}
+    .ov-detail{font-family:'Monaco','Menlo',monospace;font-size:11px;color:#666;margin:6px 0 10px}
+    </style>
+    """)
+
+    with ui.element("div").classes("ov-page"):
+        if not out_path.exists() or not out_path.is_file():
+            ui.label("Output file not found").style("font-size:14px;color:#b91c1c")
+            ui.html(html.escape(str(out_path))).style("font-size:12px;color:#888;font-family:'Monaco','Menlo',monospace")
+            ui.button("← Back", on_click=lambda: ui.navigate.to("/")).props("flat no-caps")
+            return
+
+        try:
+            raw_text = out_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            ui.label(f"Unable to read output: {exc}").style("font-size:14px;color:#b91c1c")
+            ui.button("← Back", on_click=lambda: ui.navigate.to("/")).props("flat no-caps")
+            return
+
+        lines = raw_text.splitlines() or [""]
+        line_count = len(lines)
+        try:
+            parsed = json.loads(raw_text)
+            docs_count = len(parsed) if isinstance(parsed, list) else (1 if isinstance(parsed, dict) else 0)
+        except Exception:
+            docs_count = 0
+
+        state = {
+            "lines": lines,
+            "filtered": list(range(len(lines))),
+            "page": 0,
+            "page_size": 500,
+        }
+
+        with ui.element("div").classes("ov-top"):
+            with ui.element("div"):
+                ui.html('<div class="ov-title">Output viewer</div>')
+                ui.html(f'<div class="ov-sub">{html.escape(str(out_path))}</div>')
+            with ui.row().style("gap:8px"):
+                ui.button("Download", on_click=lambda: ui.download(str(out_path), filename=out_path.name, media_type="application/json")) \
+                    .props("no-caps unelevated") \
+                    .style("background:#f9f7f5;color:#4a4a4a;border:.5px solid #e0dcd8;border-radius:6px;font-size:12px")
+                ui.button("← Back", on_click=lambda: ui.navigate.to("/")) \
+                    .props("no-caps unelevated") \
+                    .style("background:#2a2a2a;color:#fff;border-radius:6px;font-size:12px")
+
+        detail = ui.html(f'<div class="ov-detail" id="ov-detail-line">Line 1 of {line_count} · Documents: {docs_count}</div>')
+
+        with ui.element("div").classes("ov-controls"):
+            search_inp = ui.input(placeholder="Search text...").props("outlined dense") \
+                .style("min-width:220px;font-family:'Monaco','Menlo',monospace;font-size:12px")
+            jump_inp = ui.input(placeholder="Jump to line").props("outlined dense type=number") \
+                .style("width:140px;font-family:'Monaco','Menlo',monospace;font-size:12px")
+            prev_btn = ui.button("◀ Prev", on_click=lambda: go_prev()).props("flat dense no-caps").style("font-size:11px")
+            next_btn = ui.button("Next ▶", on_click=lambda: go_next()).props("flat dense no-caps").style("font-size:11px")
+            page_lbl = ui.html('<span style="font-size:11px;color:#666">Page 1 / 1</span>')
+
+        viewer = ui.html('<div id="ov-lines-body"></div>').classes("ov-box")
+
+        def set_detail_line(line_no: int) -> None:
+            detail.set_content(f'<div class="ov-detail" id="ov-detail-line">Line {line_no} of {line_count} · Documents: {docs_count}</div>')
+
+        def render_page() -> None:
+            filtered = state["filtered"]
+            if not filtered:
+                viewer.set_content('<div id="ov-lines-body" style="padding:12px;font-family:\'Monaco\',\'Menlo\',monospace;font-size:12px;color:#888">No matching lines</div>')
+                page_lbl.set_content('<span style="font-size:11px;color:#666">Page 0 / 0</span>')
+                set_detail_line(1)
+                return
+
+            page_size = state["page_size"]
+            total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+            state["page"] = max(0, min(state["page"], total_pages - 1))
+            start = state["page"] * page_size
+            end = min(len(filtered), start + page_size)
+            segment = filtered[start:end]
+
+            rows = "".join(
+                f'<div class="ov-line" data-line="{ln + 1}"><span class="ov-ln">{ln + 1}</span><span class="ov-code">{html.escape(lines[ln] if lines[ln] else " ")}</span></div>'
+                for ln in segment
+            )
+            viewer.set_content(f'<div id="ov-lines-body">{rows}</div>')
+            page_lbl.set_content(f'<span style="font-size:11px;color:#666">Page {state["page"] + 1} / {total_pages} · Showing {start + 1}-{end} of {len(filtered)}</span>')
+            set_detail_line(segment[0] + 1)
+            ui.run_javascript(
+                (
+                    "(function(){"
+                    "const body=document.getElementById('ov-lines-body');"
+                    "const detail=document.getElementById('ov-detail-line');"
+                    f"const total={line_count};"
+                    f"const docs={docs_count};"
+                    "if(!body||!detail)return;"
+                    "body.onclick=(ev)=>{const row=ev.target.closest('.ov-line');"
+                    "if(!row)return;const ln=row.getAttribute('data-line')||'1';"
+                    "detail.textContent=`Line ${ln} of ${total} · Documents: ${docs}`;};"
+                    "})();"
+                ),
+                timeout=5,
+            )
+
+        def apply_search() -> None:
+            term = (search_inp.value or "").strip().lower()
+            if not term:
+                state["filtered"] = list(range(len(lines)))
+            else:
+                state["filtered"] = [i for i, ln in enumerate(lines) if term in ln.lower()]
+            state["page"] = 0
+            render_page()
+
+        def go_prev() -> None:
+            state["page"] = max(0, state["page"] - 1)
+            render_page()
+
+        def go_next() -> None:
+            state["page"] = state["page"] + 1
+            render_page()
+
+        def jump_to_line() -> None:
+            text = (jump_inp.value or "").strip()
+            if not text:
+                return
+            try:
+                target = int(float(text))
+            except ValueError:
+                ui.notify("Invalid line number", color="warning")
+                return
+            target = max(1, min(line_count, target))
+            idx = target - 1
+            filtered = state["filtered"]
+            if idx not in filtered:
+                state["filtered"] = list(range(len(lines)))
+                search_inp.set_value("")
+                filtered = state["filtered"]
+            position = filtered.index(idx)
+            state["page"] = position // state["page_size"]
+            render_page()
+            set_detail_line(target)
+
+        search_inp.on("change", lambda _: apply_search())
+        jump_inp.on("keydown.enter", lambda _: jump_to_line())
+
+        render_page()
 
 
 ui.run(title="Mongo document generator", port=find_open_port(8080), dark=False, reload=False)

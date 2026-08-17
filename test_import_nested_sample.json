@@ -1,0 +1,189 @@
+[
+  {
+    "_id": "66b5d0f43a9c4d1f8a9f1001",
+    "account": {
+      "number": 12004567,
+      "status": "active",
+      "opened_at": "2024-03-11T10:14:22Z",
+      "limits": {
+        "daily_withdrawal": 2500,
+        "monthly_transfer": 50000,
+        "currency": "USD"
+      }
+    },
+    "profile": {
+      "name": {
+        "first": "Elena",
+        "last": "Brooks"
+      },
+      "contacts": [
+        {
+          "type": "email",
+          "value": "elena.brooks@example.com",
+          "verified": true
+        },
+        {
+          "type": "phone",
+          "value": "+1-202-555-0104",
+          "verified": false
+        }
+      ],
+      "addresses": [
+        {
+          "kind": "home",
+          "street": "145 Cedar Way",
+          "city": "Austin",
+          "state": "TX",
+          "geo": {
+            "lat": 30.2672,
+            "lng": -97.7431
+          }
+        },
+        {
+          "kind": "mailing",
+          "street": "PO Box 209",
+          "city": "Austin",
+          "state": "TX",
+          "geo": {
+            "lat": 30.2711,
+            "lng": -97.7399
+          }
+        }
+      ]
+    },
+    "risk": {
+      "score": 63,
+      "band": "medium",
+      "factors": ["velocity", "geo_mismatch", "new_device"],
+      "history": [
+        {"date": "2025-01-20", "score": 57},
+        {"date": "2025-04-20", "score": 61},
+        {"date": "2025-07-20", "score": 63}
+      ]
+    },
+    "devices": [
+      {
+        "device_id": "7d63cbcf-4f95-4bfc-8e40-b83fb588767c",
+        "platform": "ios",
+        "last_seen": "2026-05-03T07:11:45Z",
+        "trusted": true,
+        "metadata": {
+          "os_version": "17.3",
+          "app_version": "4.12.0",
+          "push_enabled": true
+        }
+      },
+      {
+        "device_id": "54de4f85-3945-4f3e-b1b9-fcd9b54800f3",
+        "platform": "web",
+        "last_seen": "2026-05-06T18:41:02Z",
+        "trusted": false,
+        "metadata": {
+          "browser": "chrome",
+          "browser_version": "125.0",
+          "push_enabled": false
+        }
+      }
+    ],
+    "balances": [
+      {"currency": "USD", "amount": 12045.19},
+      {"currency": "EUR", "amount": 212.88}
+    ],
+    "flags": {
+      "kyc_complete": true,
+      "pep_match": false,
+      "sanctions_match": false,
+      "manual_review": null
+    },
+    "event_log": [
+      {
+        "event": "login",
+        "at": "2026-07-01T11:01:12Z",
+        "ip": "203.0.113.10",
+        "context": {
+          "mfa": "sms",
+          "result": "success"
+        }
+      },
+      {
+        "event": "wire_transfer",
+        "at": "2026-07-02T16:32:40Z",
+        "ip": "198.51.100.7",
+        "context": {
+          "amount": 9800,
+          "destination_country": "GB",
+          "result": "held"
+        }
+      }
+    ]
+  },
+  {
+    "_id": "66b5d0f43a9c4d1f8a9f1002",
+    "account": {
+      "number": 13001992,
+      "status": "restricted",
+      "opened_at": "2023-09-22T08:01:30Z",
+      "limits": {
+        "daily_withdrawal": 500,
+        "monthly_transfer": 5000,
+        "currency": "USD"
+      }
+    },
+    "profile": {
+      "name": {
+        "first": "Noah",
+        "last": "Kim"
+      },
+      "contacts": [
+        {
+          "type": "email",
+          "value": "noah.kim@example.com",
+          "verified": true
+        }
+      ],
+      "addresses": [
+        {
+          "kind": "home",
+          "street": "88 Orchard Pl",
+          "city": "Seattle",
+          "state": "WA",
+          "geo": {
+            "lat": 47.6062,
+            "lng": -122.3321
+          }
+        }
+      ]
+    },
+    "risk": {
+      "score": 84,
+      "band": "high",
+      "factors": ["chargeback_history", "device_churn"],
+      "history": [
+        {"date": "2025-01-20", "score": 71},
+        {"date": "2025-04-20", "score": 79},
+        {"date": "2025-07-20", "score": 84}
+      ]
+    },
+    "devices": [],
+    "balances": [
+      {"currency": "USD", "amount": 112.4}
+    ],
+    "flags": {
+      "kyc_complete": true,
+      "pep_match": false,
+      "sanctions_match": false,
+      "manual_review": true
+    },
+    "event_log": [
+      {
+        "event": "password_reset",
+        "at": "2026-07-07T03:10:00Z",
+        "ip": "192.0.2.44",
+        "context": {
+          "method": "email",
+          "result": "success"
+        }
+      }
+    ]
+  }
+]
